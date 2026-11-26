@@ -36,7 +36,7 @@ static async Task<int> RunWorker(string workerId)
 	await using var dataSource = NpgsqlDataSource.Create(ConnectionFor(admin, schema, 16));
 
 	var services = new ServiceCollection();
-	services.AddLogging(logging => logging.SetMinimumLevel(LogLevel.Error));
+	services.AddLogging(logging => logging.SetMinimumLevel(LogLevel.Warning).AddProvider(new SoakLogProvider(dataSource, workerId)));
 	services
 		.AddJobEngine(o =>
 		{
@@ -108,7 +108,8 @@ static async Task<int> RunOrchestrator()
 	await using var dataSource = NpgsqlDataSource.Create(connectionString);
 
 	await using (var create = dataSource.CreateCommand(
-		"CREATE TABLE soak_runs (job_id uuid NOT NULL, attempt int NOT NULL, worker text NOT NULL, failed boolean NOT NULL, at timestamptz NOT NULL DEFAULT clock_timestamp());"))
+		"CREATE TABLE soak_runs (job_id uuid NOT NULL, attempt int NOT NULL, worker text NOT NULL, failed boolean NOT NULL, at timestamptz NOT NULL DEFAULT clock_timestamp());" +
+		"CREATE TABLE soak_log (worker text NOT NULL, at timestamptz NOT NULL DEFAULT clock_timestamp(), template text NOT NULL, exception text NULL);"))
 	{
 		await create.ExecuteNonQueryAsync();
 	}
@@ -256,7 +257,7 @@ static async Task<int> RunOrchestrator()
 				{
 					gaps[gap < 1 ? 0 : gap < 3 ? 1 : gap < 10 ? 2 : 3]++;
 
-					if (killedAt.TryGetValue(previousWorker, out var killTime) && (killTime - previousAt).TotalSeconds is > -1 and < 1)
+					if (killedAt.TryGetValue(previousWorker, out var killTime) && killTime >= previousAt.AddSeconds(-1) && killTime <= at)
 					{
 						afterKill++;
 					}
@@ -308,8 +309,8 @@ static async Task<int> RunOrchestrator()
 	report.AppendLine($"| Handler executions in total | {runs:N0} |");
 	report.AppendLine($"| Retries from injected failures (3% of first attempts) | {injected:N0} |");
 	report.AppendLine($"| Repeat executions in total (at-least-once) | {repeats:N0} ({repeats * 100.0 / jobCount:N1}% of jobs) |");
-	report.AppendLine($"| ...after the previous worker was killed within 1 s | {afterKill:N0} (a kill strands at most {WorkerConcurrency} jobs; {kills} kills = at most {(long)kills * WorkerConcurrency:N0}) |");
-	report.AppendLine($"| ...with no kill within 1 s of the earlier run | {afterOtherStall:N0} |");
+	report.AppendLine($"| ...earlier worker was killed between the two runs | {afterKill:N0} (a kill strands at most {WorkerConcurrency} jobs; {kills} kills = at most {(long)kills * WorkerConcurrency:N0}) |");
+	report.AppendLine($"| ...earlier worker was still alive at the repeat (lease expired without a kill) | {afterOtherStall:N0} |");
 	report.AppendLine($"| ...retries after an injected failure | {afterInjectedFailure:N0} |");
 	report.AppendLine($"| Gap between repeats of a job that had not failed: <1 s / 1-3 s / 3-10 s / 10 s+ | {gaps[0]:N0} / {gaps[1]:N0} / {gaps[2]:N0} / {gaps[3]:N0} |");
 	report.AppendLine($"| Jobs that needed more than one attempt | {multiAttempt:N0} |");
@@ -321,10 +322,34 @@ static async Task<int> RunOrchestrator()
 		report.AppendLine($"- Problem: {problem}");
 	}
 
+	report.AppendLine();
+	report.AppendLine("Warnings and errors logged by the engine inside the workers (before they were killed):");
+	report.AppendLine();
+	report.AppendLine("| Count | Message | Exception |");
+	report.AppendLine("|---|---|---|");
+
+	await using (var command = dataSource.CreateCommand(
+		"SELECT count(*), template, coalesce(exception, '-') FROM soak_log GROUP BY template, exception ORDER BY count(*) DESC LIMIT 8;"))
+	await using (var reader = await command.ExecuteReaderAsync())
+	{
+		var any = false;
+
+		while (await reader.ReadAsync())
+		{
+			any = true;
+			report.AppendLine($"| {reader.GetInt64(0):N0} | {reader.GetString(1).Replace("|", "/")} | {reader.GetString(2).Replace("|", "/")} |");
+		}
+
+		if (!any)
+		{
+			report.AppendLine("| 0 | (none) | - |");
+		}
+	}
+
 	if (samples.Count > 0)
 	{
 		report.AppendLine();
-		report.AppendLine("Examples of repeats with no kill within 1 s:");
+		report.AppendLine("Examples of repeats where the earlier worker was still alive:");
 		report.AppendLine();
 
 		foreach (var sample in samples)
@@ -362,4 +387,47 @@ static async Task<T> Scalar<T>(NpgsqlDataSource dataSource, string sql)
 	await using var command = dataSource.CreateCommand(sql);
 
 	return (T)(await command.ExecuteScalarAsync())!;
+}
+
+sealed class SoakLogProvider(NpgsqlDataSource dataSource, string workerId) : ILoggerProvider
+{
+	public ILogger CreateLogger(string categoryName) => new SoakLogger(dataSource, workerId);
+
+	public void Dispose()
+	{
+	}
+
+	private sealed class SoakLogger(NpgsqlDataSource dataSource, string workerId) : ILogger
+	{
+		public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+		public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+		public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+		{
+			if (!IsEnabled(logLevel))
+			{
+				return;
+			}
+
+			var template = (state as IReadOnlyList<KeyValuePair<string, object?>>)?.FirstOrDefault(pair => pair.Key == "{OriginalFormat}").Value?.ToString() ?? formatter(state, exception);
+			var exceptionName = exception?.GetType().Name;
+
+			_ = Task.Run(async () =>
+			{
+				try
+				{
+					await using var insert = dataSource.CreateCommand("INSERT INTO soak_log (worker, template, exception) VALUES ($1, $2, $3);");
+					insert.Parameters.AddWithValue(workerId);
+					insert.Parameters.AddWithValue(template);
+					insert.Parameters.AddWithValue((object?)exceptionName ?? DBNull.Value);
+					await insert.ExecuteNonQueryAsync();
+				}
+				catch
+				{
+					// Logging must never take the worker down.
+				}
+			});
+		}
+	}
 }
