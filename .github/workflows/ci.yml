@@ -45,6 +45,13 @@ jobs:
       - name: Benchmark (real PostgreSQL, results in the job summary)
         run: dotnet run --project benchmarks/JobEngine.Benchmarks -c Release --no-build
 
+      - name: Comparison (Hangfire on the same workload, results in the job summary)
+        run: dotnet run --project benchmarks/JobEngine.Compare -c Release --no-build
+
+      - name: Chaos soak (worker processes killed with SIGKILL while draining)
+        timeout-minutes: 12
+        run: dotnet run --project benchmarks/JobEngine.Soak -c Release --no-build
+
   demo-smoke:
     runs-on: ubuntu-latest
 
