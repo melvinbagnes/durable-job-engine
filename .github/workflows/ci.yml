@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      JOBENGINE_TEST_CONNECTION: Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore JobEngine.slnx
+
+      - name: Build
+        run: dotnet build JobEngine.slnx --no-restore -c Release
+
+      - name: Test (real PostgreSQL)
+        run: dotnet test JobEngine.slnx --no-build -c Release --verbosity normal
