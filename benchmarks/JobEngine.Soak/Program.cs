@@ -33,14 +33,14 @@ static async Task<int> RunWorker(string workerId)
 	var admin = Environment.GetEnvironmentVariable("JOBENGINE_TEST_CONNECTION")
 		?? "Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=postgres";
 
-	await using var dataSource = NpgsqlDataSource.Create(ConnectionFor(admin, schema, 16));
+	await using var dataSource = NpgsqlDataSource.Create(ConnectionFor(admin, schema, int.Parse(Environment.GetEnvironmentVariable("SOAK_HANDLER_POOL") ?? "6", CultureInfo.InvariantCulture)));
 
 	var services = new ServiceCollection();
 	services.AddLogging(logging => logging.SetMinimumLevel(LogLevel.Warning).AddProvider(new SoakLogProvider(dataSource, workerId)));
 	services
 		.AddJobEngine(o =>
 		{
-			o.ConnectionString = ConnectionFor(admin, schema, 24);
+			o.ConnectionString = ConnectionFor(admin, schema, int.Parse(Environment.GetEnvironmentVariable("SOAK_ENGINE_POOL") ?? "10", CultureInfo.InvariantCulture));
 			o.WorkerId = workerId;
 			o.Concurrency = WorkerConcurrency;
 			o.LeaseDuration = TimeSpan.FromSeconds(double.Parse(Environment.GetEnvironmentVariable("SOAK_LEASE_SECONDS") ?? "3", CultureInfo.InvariantCulture));
@@ -411,7 +411,13 @@ sealed class SoakLogProvider(NpgsqlDataSource dataSource, string workerId) : ILo
 			}
 
 			var template = (state as IReadOnlyList<KeyValuePair<string, object?>>)?.FirstOrDefault(pair => pair.Key == "{OriginalFormat}").Value?.ToString() ?? formatter(state, exception);
-			var exceptionName = exception?.GetType().Name;
+			var exceptionName = exception switch
+			{
+				null => null,
+				PostgresException pg => $"PostgresException {pg.SqlState}: {pg.MessageText}",
+				_ => exception.GetType().Name,
+			};
+			if (exceptionName is { Length: > 120 }) exceptionName = exceptionName[..120];
 
 			_ = Task.Run(async () =>
 			{
