@@ -52,11 +52,12 @@ jobs:
         timeout-minutes: 12
         run: dotnet run --project benchmarks/JobEngine.Soak -c Release --no-build
 
-      - name: Chaos soak, 15 s leases (same chaos, longer leases)
+      - name: Chaos soak, 3 s leases, oversized connection pools (diagnostic: shows what exhausting max_connections looks like)
         timeout-minutes: 12
         env:
-          SOAK_LEASE_SECONDS: "15"
-          SOAK_JOBS: "20000"
+          SOAK_JOBS: "10000"
+          SOAK_ENGINE_POOL: "24"
+          SOAK_HANDLER_POOL: "16"
         run: dotnet run --project benchmarks/JobEngine.Soak -c Release --no-build
 
   demo-smoke:
