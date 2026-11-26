@@ -1,0 +1,48 @@
+@host = http://localhost:8080
+
+### Enqueue a job that fails twice before succeeding (watch the retries in the logs)
+POST {{host}}/jobs
+Content-Type: application/json
+
+{ "type": "email.send", "queue": "emails", "payload": { "to": "ana@example.com", "subject": "Hi", "failFirst": 2 } }
+
+### Same idempotency key twice -> the second call returns the original job (created: false)
+POST {{host}}/jobs
+Content-Type: application/json
+
+{ "type": "report.generate", "idempotencyKey": "report-2026-01", "payload": {} }
+
+### A job that can never succeed -> dead-letter after one attempt
+POST {{host}}/jobs
+Content-Type: application/json
+
+{ "type": "email.send", "queue": "emails", "payload": { "subject": "no recipient" } }
+
+### Workflow (DAG): a -> (b, c) -> d
+POST {{host}}/workflows
+Content-Type: application/json
+
+{
+  "idempotencyKey": "nightly-2026-01-01",
+  "steps": [
+    { "key": "extract",   "type": "report.generate" },
+    { "key": "transform", "type": "report.generate", "dependsOn": ["extract"] },
+    { "key": "validate",  "type": "report.generate", "dependsOn": ["extract"] },
+    { "key": "load",      "type": "report.generate", "dependsOn": ["transform", "validate"] }
+  ]
+}
+
+### Transactional outbox: order row + confirmation e-mail job in ONE transaction
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "customer": "ana", "amount": 1499.50 }
+
+### Inspect
+GET {{host}}/stats
+
+###
+GET {{host}}/jobs/00000000-0000-0000-0000-000000000000
+
+### Replay a dead-lettered job
+POST {{host}}/jobs/00000000-0000-0000-0000-000000000000/requeue
