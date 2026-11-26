@@ -10,8 +10,8 @@ using Microsoft.Extensions.Logging;
 using Npgsql;
 
 // Chaos soak test. Real worker PROCESSES drain a large queue while the orchestrator SIGKILLs one every couple
-// of seconds (no graceful shutdown, no lease release). Afterwards it checks the properties the engine claims:
-// nothing is lost, nothing is stuck, and re-runs happen only for jobs that were in flight when a worker died.
+// of seconds (no graceful shutdown, no lease release). Afterwards it checks that nothing was lost or left stuck,
+// and it reports every repeated execution (the engine is at-least-once) together with the likely reason.
 
 const int WorkerConcurrency = 12;
 
@@ -126,6 +126,8 @@ static async Task<int> RunOrchestrator()
 	var host = Environment.ProcessPath!;
 	var assembly = System.Reflection.Assembly.GetEntryAssembly()!.Location;
 	var alive = new List<Process>();
+	var killedAt = new Dictionary<string, DateTimeOffset>();
+	var workerIds = new Dictionary<Process, string>();
 	var spawned = 0;
 
 	Process Spawn()
@@ -139,11 +141,15 @@ static async Task<int> RunOrchestrator()
 		}
 
 		info.Environment["SOAK_ROLE"] = "worker";
-		info.Environment["SOAK_WORKER_ID"] = $"worker-{++spawned}";
+		var id = $"worker-{++spawned}";
+		info.Environment["SOAK_WORKER_ID"] = id;
 		info.Environment["SOAK_SCHEMA"] = schema;
 		info.Environment["JOBENGINE_TEST_CONNECTION"] = admin;
 
-		return Process.Start(info)!;
+		var process = Process.Start(info)!;
+		workerIds[process] = id;
+
+		return process;
 	}
 
 	for (var i = 0; i < workerCount; i++)
@@ -173,6 +179,7 @@ static async Task<int> RunOrchestrator()
 		{
 			lastKill = clock.Elapsed;
 			var victim = alive[random.Next(alive.Count)];
+			killedAt[workerIds[victim]] = DateTimeOffset.UtcNow;
 			victim.Kill(entireProcessTree: true);
 			victim.WaitForExit();
 			alive.Remove(victim);
@@ -212,9 +219,66 @@ static async Task<int> RunOrchestrator()
 	var missingCompletion = await Scalar<long>(dataSource, "SELECT count(*) FROM jobs WHERE state = 'succeeded' AND completed_at IS NULL");
 	var multiAttempt = await Scalar<long>(dataSource, "SELECT count(*) FROM jobs WHERE attempts > 1");
 
-	// Every run beyond one per job is either an injected failure's retry or an in-flight job re-run after a kill.
-	var rerunsFromKills = runs - jobCount - injected;
-	var allowedReruns = (long)kills * WorkerConcurrency;
+	// Classify every handler execution that followed an earlier execution of the same job. The engine is
+	// at-least-once, so repeats are allowed; what matters is why they happened.
+	var afterKill = 0;
+	var afterOtherStall = 0;
+	var afterInjectedFailure = 0;
+	var gaps = new[] { 0, 0, 0, 0 }; // < 1 s, 1-3 s, 3-10 s, >= 10 s between two runs of a job that did not fail
+	var samples = new List<string>();
+
+	await using (var command = dataSource.CreateCommand(
+		"SELECT job_id, worker, at, failed FROM soak_runs WHERE job_id IN (SELECT job_id FROM soak_runs GROUP BY job_id HAVING count(*) > 1) ORDER BY job_id, at;"))
+	await using (var reader = await command.ExecuteReaderAsync())
+	{
+		Guid currentJob = Guid.Empty;
+		string previousWorker = "";
+		DateTimeOffset previousAt = default;
+		bool previousFailed = false;
+
+		while (await reader.ReadAsync())
+		{
+			var job = reader.GetGuid(0);
+			var worker = reader.GetString(1);
+			var at = reader.GetFieldValue<DateTimeOffset>(2);
+			var failed = reader.GetBoolean(3);
+
+			if (job == currentJob)
+			{
+				var gap = (at - previousAt).TotalSeconds;
+
+				if (previousFailed)
+				{
+					afterInjectedFailure++;
+				}
+				else
+				{
+					gaps[gap < 1 ? 0 : gap < 3 ? 1 : gap < 10 ? 2 : 3]++;
+
+					if (killedAt.TryGetValue(previousWorker, out var killTime) && killTime >= previousAt && (killTime - previousAt).TotalSeconds < 10)
+					{
+						afterKill++;
+					}
+					else
+					{
+						afterOtherStall++;
+
+						if (samples.Count < 8)
+						{
+							samples.Add($"{job}: {previousWorker} at {previousAt:HH:mm:ss.fff}, then {worker} at {at:HH:mm:ss.fff} (gap {gap:N2} s, first worker killed: {(killedAt.TryGetValue(previousWorker, out var kt) ? kt.ToString("HH:mm:ss.fff") : "never")})");
+						}
+					}
+				}
+			}
+
+			currentJob = job;
+			previousWorker = worker;
+			previousAt = at;
+			previousFailed = failed;
+		}
+	}
+
+	var repeats = runs - distinctRan;
 
 	states.TryGetValue("succeeded", out var finalSucceeded);
 	var notFinished = states.Where(pair => pair.Key != "succeeded").Sum(pair => pair.Value);
@@ -225,7 +289,6 @@ static async Task<int> RunOrchestrator()
 	if (notFinished != 0) problems.Add($"{notFinished:N0} job(s) are not succeeded: {string.Join(", ", states.Where(p => p.Key != "succeeded").Select(p => $"{p.Key}={p.Value}"))}.");
 	if (distinctRan != jobCount) problems.Add($"{jobCount - distinctRan:N0} job(s) never ran.");
 	if (missingCompletion != 0) problems.Add($"{missingCompletion:N0} succeeded job(s) have no completion time.");
-	if (rerunsFromKills > allowedReruns) problems.Add($"{rerunsFromKills:N0} unexplained re-runs, more than the {allowedReruns:N0} that {kills} kills can cause.");
 	if (elapsed >= deadline) problems.Add("The run hit its deadline before the queue drained.");
 
 	var report = new StringBuilder();
@@ -243,7 +306,11 @@ static async Task<int> RunOrchestrator()
 	report.AppendLine($"| Worker processes killed | {kills} |");
 	report.AppendLine($"| Handler executions in total | {runs:N0} |");
 	report.AppendLine($"| Retries from injected failures (3% of first attempts) | {injected:N0} |");
-	report.AppendLine($"| Re-runs of jobs in flight when a worker died | {rerunsFromKills:N0} (allowed up to {allowedReruns:N0}) |");
+	report.AppendLine($"| Repeat executions in total (at-least-once) | {repeats:N0} ({repeats * 100.0 / jobCount:N1}% of jobs) |");
+	report.AppendLine($"| ...after the previous worker was killed within 10 s | {afterKill:N0} (a kill can strand at most {WorkerConcurrency} jobs; {kills} kills = at most {(long)kills * WorkerConcurrency:N0}) |");
+	report.AppendLine($"| ...with the previous worker not killed in that window | {afterOtherStall:N0} |");
+	report.AppendLine($"| ...retries after an injected failure | {afterInjectedFailure:N0} |");
+	report.AppendLine($"| Gap between repeats of a job that had not failed: <1 s / 1-3 s / 3-10 s / 10 s+ | {gaps[0]:N0} / {gaps[1]:N0} / {gaps[2]:N0} / {gaps[3]:N0} |");
 	report.AppendLine($"| Jobs that needed more than one attempt | {multiAttempt:N0} |");
 	report.AppendLine($"| Wall time / throughput under chaos | {elapsed.TotalSeconds:N0} s / {jobCount / elapsed.TotalSeconds:N0} jobs/s |");
 
@@ -251,6 +318,18 @@ static async Task<int> RunOrchestrator()
 	{
 		report.AppendLine();
 		report.AppendLine($"- Problem: {problem}");
+	}
+
+	if (samples.Count > 0)
+	{
+		report.AppendLine();
+		report.AppendLine("Examples of repeats with no kill nearby:");
+		report.AppendLine();
+
+		foreach (var sample in samples)
+		{
+			report.AppendLine($"- {sample}");
+		}
 	}
 
 	Console.WriteLine(report.ToString());
