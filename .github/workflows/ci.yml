@@ -48,8 +48,15 @@ jobs:
       - name: Comparison (Hangfire on the same workload, results in the job summary)
         run: dotnet run --project benchmarks/JobEngine.Compare -c Release --no-build
 
-      - name: Chaos soak (worker processes killed with SIGKILL while draining)
+      - name: Chaos soak, 3 s leases (worker processes killed with SIGKILL while draining)
         timeout-minutes: 12
+        run: dotnet run --project benchmarks/JobEngine.Soak -c Release --no-build
+
+      - name: Chaos soak, 15 s leases (same chaos, longer leases)
+        timeout-minutes: 12
+        env:
+          SOAK_LEASE_SECONDS: "15"
+          SOAK_JOBS: "20000"
         run: dotnet run --project benchmarks/JobEngine.Soak -c Release --no-build
 
   demo-smoke:
