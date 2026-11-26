@@ -1,0 +1,25 @@
+name: bootstrap
+on:
+  push:
+    paths: ["project.tgz"]
+permissions:
+  contents: write
+  actions: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack and commit
+        run: |
+          tar -xzf project.tgz
+          rm project.tgz
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add timeouts, telemetry, archive, queue limits, soak and comparison benchmarks"
+          git push
+      - name: Dispatch CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref main
