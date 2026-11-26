@@ -12,6 +12,7 @@ namespace JobEngine.Runtime;
 public sealed class JobWorker(
 	JobStore store,
 	JobProcessor processor,
+	WakeSignal wakeSignal,
 	JobEngineOptions options,
 	ILogger<JobWorker> logger) : BackgroundService
 {
@@ -52,7 +53,7 @@ public sealed class JobWorker(
 				if (claimed.Count == 0)
 				{
 					slots.Release();
-					await Task.Delay(options.PollInterval, stoppingToken);
+					await wakeSignal.WaitAsync(options.PollInterval, stoppingToken);
 
 					continue;
 				}

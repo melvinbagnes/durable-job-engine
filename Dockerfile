@@ -5,6 +5,7 @@ COPY JobEngine.slnx ./
 COPY src/JobEngine/JobEngine.csproj src/JobEngine/
 COPY src/JobEngine.Demo/JobEngine.Demo.csproj src/JobEngine.Demo/
 COPY tests/JobEngine.Tests/JobEngine.Tests.csproj tests/JobEngine.Tests/
+COPY benchmarks/JobEngine.Benchmarks/JobEngine.Benchmarks.csproj benchmarks/JobEngine.Benchmarks/
 RUN dotnet restore JobEngine.slnx
 
 COPY . .

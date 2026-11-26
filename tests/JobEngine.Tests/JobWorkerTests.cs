@@ -13,7 +13,8 @@ public class JobWorkerTests : PostgresTestBase
 {
 	private int _longRunningCalls;
 
-	protected override TimeProvider CreateTimeProvider() => TimeProvider.System;
+	/// <summary>No TimeProvider: the store and the engine under test both use the database clock.</summary>
+	protected override TimeProvider? CreateTimeProvider() => null;
 
 	private sealed class RunningEngine(ServiceProvider provider) : IAsyncDisposable
 	{
@@ -58,6 +59,7 @@ public class JobWorkerTests : PostgresTestBase
 		{
 			options.ConnectionString = Options.ConnectionString;
 			options.WorkerId = "test-worker";
+			options.NotificationChannel = Options.NotificationChannel;
 			options.PollInterval = TimeSpan.FromMilliseconds(50);
 			options.LeaseDuration = TimeSpan.FromSeconds(5);
 			options.SchedulerInterval = TimeSpan.FromMilliseconds(100);
@@ -343,5 +345,100 @@ public class JobWorkerTests : PostgresTestBase
 		Assert.Throws<InvalidOperationException>(() => Build(builder => builder
 			.AddHandler("dup", (_, _) => Task.CompletedTask)
 			.AddHandler("dup", (_, _) => Task.CompletedTask)));
+	}
+
+	// ------------------------------------------------------------ LISTEN/NOTIFY
+
+	[Fact]
+	public async Task Notify_WakesAnIdleWorker_WithoutWaitingForThePollInterval()
+	{
+		await using var engine = Build(
+			builder => builder.AddHandler("ping", (_, _) => Task.CompletedTask),
+			options => options.PollInterval = TimeSpan.FromSeconds(60));
+
+		await engine.StartAsync();
+		await Task.Delay(500); // the first (empty) claim is done and the worker is waiting
+
+		var id = (await Store.EnqueueAsync(Job("ping"))).JobId;
+
+		await WaitUntilAsync(async () => (await GetJobAsync(id)).State == JobState.Succeeded, TimeSpan.FromSeconds(10));
+	}
+
+	[Fact]
+	public async Task WithoutNotify_AnIdleWorkerOnlyNoticesTheJobAtTheNextPoll()
+	{
+		await using var engine = Build(
+			builder => builder.AddHandler("ping", (_, _) => Task.CompletedTask),
+			options =>
+			{
+				options.UseListenNotify = false;
+				options.PollInterval = TimeSpan.FromSeconds(60);
+			});
+
+		await engine.StartAsync();
+		await Task.Delay(500);
+
+		var id = (await Store.EnqueueAsync(Job("ping"))).JobId;
+
+		await Task.Delay(1500);
+
+		Assert.Equal(JobState.Queued, (await GetJobAsync(id)).State);
+	}
+
+	[Fact]
+	public async Task Notify_WakesTheWorkerWhenADependencyCompletes()
+	{
+		await using var engine = Build(
+			builder => builder
+				.AddHandler("a", (_, _) => Task.CompletedTask)
+				.AddHandler("b", (_, _) => Task.CompletedTask),
+			options => options.PollInterval = TimeSpan.FromSeconds(60));
+
+		await engine.StartAsync();
+		await Task.Delay(500);
+
+		var result = await Store.EnqueueWorkflowAsync([Step("a").Build(), Step("b").After("a").Build()]);
+
+		await WaitUntilAsync(
+			async () => (await GetJobAsync(result.JobIds["b"])).State == JobState.Succeeded,
+			TimeSpan.FromSeconds(10));
+	}
+
+	[Fact]
+	public async Task Notify_FromACallersTransaction_WakesTheWorkerOnlyAfterCommit()
+	{
+		await using var engine = Build(
+			builder => builder.AddHandler("ping", (_, _) => Task.CompletedTask),
+			options => options.PollInterval = TimeSpan.FromSeconds(60));
+
+		await engine.StartAsync();
+		await Task.Delay(500);
+
+		Guid id;
+
+		await using (var connection = await DataSource.OpenConnectionAsync())
+		await using (var transaction = await connection.BeginTransactionAsync())
+		{
+			id = (await Store.EnqueueAsync(transaction, Job("ping"))).JobId;
+
+			await Task.Delay(500);
+			await transaction.CommitAsync();
+		}
+
+		await WaitUntilAsync(async () => (await GetJobAsync(id)).State == JobState.Succeeded, TimeSpan.FromSeconds(10));
+	}
+
+	[Fact]
+	public async Task DelayedJob_RunsOnceDue_EvenWithNoNotificationForIt()
+	{
+		await using var engine = Build(
+			builder => builder.AddHandler("later", (_, _) => Task.CompletedTask),
+			options => options.PollInterval = TimeSpan.FromMilliseconds(100));
+
+		await engine.StartAsync();
+
+		var id = (await Store.EnqueueAsync(new EnqueueRequest { Type = "later", Delay = TimeSpan.FromSeconds(1) })).JobId;
+
+		await WaitUntilAsync(async () => (await GetJobAsync(id)).State == JobState.Succeeded, TimeSpan.FromSeconds(10));
 	}
 }

@@ -3,7 +3,7 @@ using System.Globalization;
 namespace JobEngine.Scheduling;
 
 /// <summary>
-/// Minimal 5-field cron (minute hour day-of-month month day-of-week), evaluated in UTC.
+/// Minimal 5-field cron (minute hour day-of-month month day-of-week), evaluated in UTC or in an IANA time zone.
 /// Supports *, lists (a,b), ranges (a-b) and steps (*/n, a-b/n, a/n).
 /// As in classic cron, when both day-of-month and day-of-week are restricted a day matches if either does.
 /// </summary>
@@ -16,6 +16,7 @@ public sealed class CronExpression
 	private readonly bool[] _daysOfWeek = new bool[7];
 	private readonly bool _dayOfMonthRestricted;
 	private readonly bool _dayOfWeekRestricted;
+	private readonly bool _everyHour;
 
 	private CronExpression(string expression, string[] fields)
 	{
@@ -40,6 +41,7 @@ public sealed class CronExpression
 			_daysOfWeek[0] = true;
 		}
 
+		_everyHour = _hours.All(enabled => enabled);
 		_dayOfMonthRestricted = !fields[2].StartsWith('*');
 		_dayOfWeekRestricted = !fields[4].StartsWith('*');
 	}
@@ -75,9 +77,147 @@ public sealed class CronExpression
 	}
 
 	/// <summary>The first matching minute strictly after <paramref name="afterUtc"/>, or null if none within 10 years.</summary>
-	public DateTime? GetNextOccurrence(DateTime afterUtc)
+	/// <param name="timeZone">
+	/// The zone the expression is written in; null means UTC. Daylight-saving rules:
+	/// a schedule that runs in every hour (e.g. "*/10 * * * *") follows real elapsed time, so it neither skips the
+	/// hour that does not exist in spring nor misses the repeated hour in autumn. A schedule that names hours
+	/// (e.g. "30 2 * * *") runs once per wall-clock day: a time that does not exist is moved to the same instant
+	/// shifted past the gap (02:30 becomes 03:30), and a time that occurs twice runs at its first occurrence only.
+	/// </param>
+	public DateTime? GetNextOccurrence(DateTime afterUtc, TimeZoneInfo? timeZone = null)
 	{
-		var after = afterUtc.Kind == DateTimeKind.Local ? afterUtc.ToUniversalTime() : afterUtc;
+		var after = ToUtc(afterUtc);
+
+		if (timeZone is null || (timeZone.BaseUtcOffset == TimeSpan.Zero && !timeZone.SupportsDaylightSavingTime))
+		{
+			return NextWallTime(after);
+		}
+
+		return _everyHour ? NextOnElapsedTime(after, timeZone) : NextOnWallClock(after, timeZone);
+	}
+
+	private static DateTime ToUtc(DateTime value) =>
+		value.Kind == DateTimeKind.Local ? value.ToUniversalTime() : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+
+	private DateTime? NextOnWallClock(DateTime afterUtc, TimeZoneInfo timeZone)
+	{
+		var local = TimeZoneInfo.ConvertTimeFromUtc(afterUtc, timeZone);
+
+		for (var attempt = 0; attempt < 1000; attempt++)
+		{
+			var wall = NextWallTime(local);
+
+			if (wall is null)
+			{
+				return null;
+			}
+
+			var utc = ResolveToUtc(DateTime.SpecifyKind(wall.Value, DateTimeKind.Unspecified), timeZone);
+
+			if (utc > afterUtc)
+			{
+				return utc;
+			}
+
+			local = wall.Value;
+		}
+
+		return null;
+	}
+
+	private static DateTime ResolveToUtc(DateTime wallClock, TimeZoneInfo timeZone)
+	{
+		TimeSpan offset;
+
+		if (timeZone.IsInvalidTime(wallClock))
+		{
+			offset = timeZone.BaseUtcOffset;
+		}
+		else if (timeZone.IsAmbiguousTime(wallClock))
+		{
+			offset = timeZone.GetAmbiguousTimeOffsets(wallClock).Max();
+		}
+		else
+		{
+			offset = timeZone.GetUtcOffset(wallClock);
+		}
+
+		return DateTime.SpecifyKind(wallClock - offset, DateTimeKind.Utc);
+	}
+
+	/// <summary>Walks the zone's UTC-offset segments; inside one segment local time is just UTC plus a fixed offset.</summary>
+	private DateTime? NextOnElapsedTime(DateTime afterUtc, TimeZoneInfo timeZone)
+	{
+		var cursor = new DateTime(afterUtc.Year, afterUtc.Month, afterUtc.Day, afterUtc.Hour, afterUtc.Minute, 0, DateTimeKind.Utc)
+			.AddMinutes(1);
+
+		for (var segment = 0; segment < 200; segment++)
+		{
+			var offset = timeZone.GetUtcOffset(cursor);
+			var segmentEnd = NextOffsetChange(cursor, offset, timeZone);
+			var wall = NextWallTime(cursor + offset - TimeSpan.FromMinutes(1));
+
+			if (wall is null)
+			{
+				return null;
+			}
+
+			var utc = DateTime.SpecifyKind(wall.Value - offset, DateTimeKind.Utc);
+
+			if (segmentEnd is null || utc < segmentEnd.Value)
+			{
+				return utc;
+			}
+
+			cursor = segmentEnd.Value;
+		}
+
+		return null;
+	}
+
+	private static DateTime? NextOffsetChange(DateTime from, TimeSpan offset, TimeZoneInfo timeZone)
+	{
+		if (!timeZone.SupportsDaylightSavingTime)
+		{
+			return null;
+		}
+
+		var low = from;
+
+		for (var days = 1; days <= 400; days++)
+		{
+			var high = from.AddDays(days);
+
+			if (timeZone.GetUtcOffset(high) == offset)
+			{
+				low = high;
+
+				continue;
+			}
+
+			while (high - low > TimeSpan.FromMinutes(1))
+			{
+				var middle = low + TimeSpan.FromTicks((high - low).Ticks / 2);
+
+				if (timeZone.GetUtcOffset(middle) == offset)
+				{
+					low = middle;
+				}
+				else
+				{
+					high = middle;
+				}
+			}
+
+			return new DateTime(high.Year, high.Month, high.Day, high.Hour, high.Minute, 0, DateTimeKind.Utc);
+		}
+
+		return null;
+	}
+
+	/// <summary>Next match strictly after a wall-clock instant, ignoring time zones (the value's Kind is irrelevant).</summary>
+	private DateTime? NextWallTime(DateTime after)
+	{
 		var candidate = new DateTime(after.Year, after.Month, after.Day, after.Hour, after.Minute, 0, DateTimeKind.Utc).AddMinutes(1);
 		var limit = candidate.AddYears(10);
 

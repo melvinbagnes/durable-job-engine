@@ -563,4 +563,72 @@ public class JobStoreTests : PostgresTestBase
 		Assert.Equal(0, await Store.PurgeAsync(TimeSpan.FromHours(1)));
 		Assert.NotNull(await Store.GetAsync(result.JobIds["a"]));
 	}
+
+	[Fact]
+	public async Task Schedule_WithATimeZone_FiresAtLocalWallClockTime()
+	{
+		// Clock: 2026-01-01 12:00 UTC = 20:00 in Manila, so the next 09:00 Manila is 2026-01-02 01:00 UTC.
+		await Store.UpsertScheduleAsync(new RecurringJobDefinition("morning", "0 9 * * *", "digest", TimeZone: "Asia/Manila"));
+
+		Assert.Equal(
+			new DateTime(2026, 1, 2, 1, 0, 0, DateTimeKind.Utc),
+			await ScalarAsync<DateTime>("SELECT next_run_at FROM schedules WHERE name = 'morning'"));
+
+		Clock.Advance(TimeSpan.FromHours(13).Add(TimeSpan.FromMinutes(5))); // 2026-01-02 01:05 UTC
+
+		Assert.Equal(1, await Store.FireDueSchedulesAsync());
+		Assert.Equal(
+			new DateTime(2026, 1, 3, 1, 0, 0, DateTimeKind.Utc),
+			await ScalarAsync<DateTime>("SELECT next_run_at FROM schedules WHERE name = 'morning'"));
+	}
+
+	[Fact]
+	public async Task Schedule_ChangingOnlyTheTimeZone_RecomputesTheNextSlot()
+	{
+		await Store.UpsertScheduleAsync(new RecurringJobDefinition("morning", "0 9 * * *", "digest"));
+
+		Assert.Equal(
+			new DateTime(2026, 1, 2, 9, 0, 0, DateTimeKind.Utc),
+			await ScalarAsync<DateTime>("SELECT next_run_at FROM schedules WHERE name = 'morning'"));
+
+		await Store.UpsertScheduleAsync(new RecurringJobDefinition("morning", "0 9 * * *", "digest", TimeZone: "Asia/Manila"));
+
+		Assert.Equal(
+			new DateTime(2026, 1, 2, 1, 0, 0, DateTimeKind.Utc),
+			await ScalarAsync<DateTime>("SELECT next_run_at FROM schedules WHERE name = 'morning'"));
+		Assert.Equal("Asia/Manila", await ScalarAsync<string>("SELECT time_zone FROM schedules WHERE name = 'morning'"));
+	}
+
+	[Fact]
+	public async Task Schedule_Redeploy_WithTheSameTimeZone_KeepsTheNextSlot()
+	{
+		await Store.UpsertScheduleAsync(new RecurringJobDefinition("morning", "0 9 * * *", "digest", TimeZone: "Asia/Manila"));
+		Clock.Advance(TimeSpan.FromHours(20)); // 08:00 UTC on Jan 2: the 01:00 slot is overdue but has not fired
+		await Store.UpsertScheduleAsync(new RecurringJobDefinition("morning", "0 9 * * *", "digest", TimeZone: "Asia/Manila"));
+
+		Assert.Equal(
+			new DateTime(2026, 1, 2, 1, 0, 0, DateTimeKind.Utc),
+			await ScalarAsync<DateTime>("SELECT next_run_at FROM schedules WHERE name = 'morning'"));
+	}
+
+	[Fact]
+	public async Task Schedule_RejectsAnUnknownTimeZone()
+	{
+		await Assert.ThrowsAsync<TimeZoneNotFoundException>(() => Store.UpsertScheduleAsync(
+			new RecurringJobDefinition("bad", "0 9 * * *", "digest", TimeZone: "Mars/Olympus_Mons")));
+	}
+
+	// ------------------------------------------------------------ notifications
+
+	[Fact]
+	public void Options_RejectAnUnsafeNotificationChannelName()
+	{
+		var options = new JobEngineOptions
+		{
+			ConnectionString = Options.ConnectionString,
+			NotificationChannel = "x\"; DROP TABLE jobs; --"
+		};
+
+		Assert.Throws<ArgumentException>(() => JobStore.Create(options));
+	}
 }

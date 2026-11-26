@@ -125,4 +125,108 @@ public class CronExpressionTests
 		Assert.Throws<FormatException>(() => CronExpression.Parse(expression));
 		Assert.False(CronExpression.TryParse(expression, out _));
 	}
+
+	// ------------------------------------------------------------ time zones
+
+	private static readonly TimeZoneInfo NewYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+	private static readonly TimeZoneInfo London = TimeZoneInfo.FindSystemTimeZoneById("Europe/London");
+	private static readonly TimeZoneInfo Manila = TimeZoneInfo.FindSystemTimeZoneById("Asia/Manila");
+
+	private static List<DateTime> Occurrences(string expression, TimeZoneInfo zone, DateTime afterUtc, DateTime untilUtc)
+	{
+		var cron = CronExpression.Parse(expression);
+		var found = new List<DateTime>();
+		var cursor = afterUtc;
+
+		while (cron.GetNextOccurrence(cursor, zone) is { } next && next < untilUtc)
+		{
+			found.Add(next);
+			cursor = next;
+		}
+
+		return found;
+	}
+
+	private static void AssertSpacing(List<DateTime> runs, TimeSpan expected)
+	{
+		for (var i = 1; i < runs.Count; i++)
+		{
+			Assert.Equal(expected, runs[i] - runs[i - 1]);
+		}
+	}
+
+	[Fact]
+	public void TimeZone_FixedOffsetZone_ShiftsTheWallClockTime()
+	{
+		var next = CronExpression.Parse("0 9 * * *").GetNextOccurrence(Utc(2026, 1, 1, 0, 0), Manila);
+
+		Assert.Equal(Utc(2026, 1, 1, 1, 0), next); // 09:00 in Manila is 01:00 UTC
+	}
+
+	[Fact]
+	public void TimeZone_NullOrUtcBehavesLikeNoZone()
+	{
+		var cron = CronExpression.Parse("0 9 * * *");
+		var after = Utc(2026, 1, 1, 0, 0);
+
+		Assert.Equal(cron.GetNextOccurrence(after), cron.GetNextOccurrence(after, null));
+		Assert.Equal(cron.GetNextOccurrence(after), cron.GetNextOccurrence(after, TimeZoneInfo.Utc));
+	}
+
+	[Fact]
+	public void TimeZone_DailyScheduleFollowsDaylightSaving()
+	{
+		var cron = CronExpression.Parse("0 9 * * *");
+
+		Assert.Equal(Utc(2026, 3, 7, 14, 0), cron.GetNextOccurrence(Utc(2026, 3, 6, 15, 0), NewYork)); // EST, UTC-5
+		Assert.Equal(Utc(2026, 3, 8, 13, 0), cron.GetNextOccurrence(Utc(2026, 3, 7, 15, 0), NewYork)); // EDT, UTC-4
+		Assert.Equal(Utc(2026, 6, 1, 8, 0), CronExpression.Parse("0 9 * * *").GetNextOccurrence(Utc(2026, 6, 1, 0, 0), London));
+	}
+
+	[Fact]
+	public void TimeZone_TimeInTheSpringGap_RunsOnceShiftedPastTheGap()
+	{
+		var cron = CronExpression.Parse("30 2 * * *");
+
+		// 02:30 does not exist on 2026-03-08 in New York; it runs at 03:30 EDT (07:30 UTC) and not again that day.
+		Assert.Equal(Utc(2026, 3, 8, 7, 30), cron.GetNextOccurrence(Utc(2026, 3, 8, 0, 0), NewYork));
+		Assert.Equal(Utc(2026, 3, 9, 6, 30), cron.GetNextOccurrence(Utc(2026, 3, 8, 7, 30), NewYork));
+	}
+
+	[Fact]
+	public void TimeZone_TimeRepeatedInAutumn_RunsAtItsFirstOccurrenceOnly()
+	{
+		var cron = CronExpression.Parse("30 1 * * *");
+
+		// 01:30 happens twice on 2026-11-01 in New York (05:30 UTC and 06:30 UTC); only the first counts.
+		Assert.Equal(Utc(2026, 11, 1, 5, 30), cron.GetNextOccurrence(Utc(2026, 11, 1, 0, 0), NewYork));
+		Assert.Equal(Utc(2026, 11, 2, 6, 30), cron.GetNextOccurrence(Utc(2026, 11, 1, 5, 30), NewYork));
+	}
+
+	[Fact]
+	public void TimeZone_EveryTenMinutes_KeepsFiringAcrossTheSpringGap()
+	{
+		var runs = Occurrences("*/10 * * * *", NewYork, Utc(2026, 3, 8, 5, 55), Utc(2026, 3, 8, 9, 0));
+
+		Assert.Equal(18, runs.Count); // 06:00..08:50 UTC, every 10 minutes of real time, nothing skipped
+		AssertSpacing(runs, TimeSpan.FromMinutes(10));
+		Assert.Contains(Utc(2026, 3, 8, 7, 0), runs); // 03:00 EDT, straight after 01:50 EST
+	}
+
+	[Fact]
+	public void TimeZone_EveryTenMinutes_FiresThroughTheRepeatedHour()
+	{
+		var runs = Occurrences("*/10 * * * *", NewYork, Utc(2026, 11, 1, 4, 55), Utc(2026, 11, 1, 8, 0));
+
+		Assert.Equal(18, runs.Count); // 05:00..07:50 UTC; the 01:00-01:59 hour is run twice
+		AssertSpacing(runs, TimeSpan.FromMinutes(10));
+	}
+
+	[Fact]
+	public void TimeZone_Hourly_FiresInBothInstancesOfTheRepeatedHour()
+	{
+		var runs = Occurrences("0 * * * *", NewYork, Utc(2026, 11, 1, 4, 30), Utc(2026, 11, 1, 8, 0));
+
+		Assert.Equal(new[] { Utc(2026, 11, 1, 5, 0), Utc(2026, 11, 1, 6, 0), Utc(2026, 11, 1, 7, 0) }, runs);
+	}
 }

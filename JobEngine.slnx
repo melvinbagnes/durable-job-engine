@@ -3,6 +3,9 @@
 		<Project Path="src/JobEngine/JobEngine.csproj" />
 		<Project Path="src/JobEngine.Demo/JobEngine.Demo.csproj" />
 	</Folder>
+	<Folder Name="/benchmarks/">
+		<Project Path="benchmarks/JobEngine.Benchmarks/JobEngine.Benchmarks.csproj" />
+	</Folder>
 	<Folder Name="/tests/">
 		<Project Path="tests/JobEngine.Tests/JobEngine.Tests.csproj" />
 	</Folder>

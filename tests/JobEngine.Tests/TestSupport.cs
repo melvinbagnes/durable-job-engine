@@ -39,7 +39,7 @@ public abstract class PostgresTestBase : IAsyncLifetime
 	protected NpgsqlDataSource DataSource { get; private set; } = null!;
 
 	/// <summary>Store tests use a fake clock so leases and backoff can be fast-forwarded.</summary>
-	protected virtual TimeProvider CreateTimeProvider() => Clock;
+	protected virtual TimeProvider? CreateTimeProvider() => Clock;
 
 	public virtual async Task InitializeAsync()
 	{
@@ -59,7 +59,8 @@ public abstract class PostgresTestBase : IAsyncLifetime
 		Options = new JobEngineOptions
 		{
 			ConnectionString = connectionString,
-			DefaultMaxAttempts = 3
+			DefaultMaxAttempts = 3,
+			NotificationChannel = "n_" + _schema[2..]
 		};
 
 		DataSource = NpgsqlDataSource.Create(connectionString);

@@ -53,6 +53,7 @@ public sealed class JobHandlerRegistry
 
 		// Fail at startup, not at the first tick, if the expression is wrong.
 		CronExpression.Parse(definition.Cron);
+		TimeZones.Resolve(definition.TimeZone);
 
 		if (_recurring.Any(r => r.Name == definition.Name))
 		{

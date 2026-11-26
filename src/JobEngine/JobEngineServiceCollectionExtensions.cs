@@ -49,19 +49,21 @@ public static class JobEngineServiceCollectionExtensions
 
 		services.AddLogging();
 		services.AddOptions<JobEngineOptions>().Configure(configure);
-		services.TryAddSingleton(TimeProvider.System);
 		services.AddSingleton(provider => provider.GetRequiredService<IOptions<JobEngineOptions>>().Value);
 
 		var registry = new JobHandlerRegistry();
 		services.AddSingleton(registry);
 
+		// No TimeProvider unless the application registered one: timestamps then come from the database clock.
 		services.AddSingleton(provider => JobStore.Create(
 			provider.GetRequiredService<JobEngineOptions>(),
-			provider.GetRequiredService<TimeProvider>()));
+			provider.GetService<TimeProvider>()));
+		services.AddSingleton<WakeSignal>();
 		services.AddSingleton<JobProcessor>();
 
 		// Hosted services start in registration order: migrate first, then run.
 		services.AddHostedService<JobEngineMigrator>();
+		services.AddHostedService<JobNotificationListener>();
 		services.AddHostedService<JobWorker>();
 		services.AddHostedService<SchedulerService>();
 

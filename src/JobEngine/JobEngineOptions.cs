@@ -14,7 +14,16 @@ public sealed class JobEngineOptions
 	/// <summary>Maximum number of jobs this process runs at the same time.</summary>
 	public int Concurrency { get; set; } = 4;
 
-	/// <summary>How long an idle worker sleeps between polls.</summary>
+	/// <summary>
+	/// Idle workers are woken by PostgreSQL LISTEN/NOTIFY the moment a job becomes runnable. Polling stays as a
+	/// backstop: it picks up delayed jobs and retries when they come due, and covers a dropped listener connection.
+	/// </summary>
+	public bool UseListenNotify { get; set; } = true;
+
+	/// <summary>Channel name. Channels are database-wide, so give each environment sharing a database its own.</summary>
+	public string NotificationChannel { get; set; } = "job_engine";
+
+	/// <summary>How long an idle worker waits for a notification before polling anyway.</summary>
 	public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(1);
 
 	/// <summary>

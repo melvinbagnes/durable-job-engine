@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using JobEngine;
 using JobEngine.Demo;
 using JobEngine.Jobs;
@@ -11,6 +12,9 @@ var builder = WebApplication.CreateBuilder(args);
 
 var connectionString = builder.Configuration.GetConnectionString("Postgres")
 	?? "Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=jobengine";
+
+builder.Services.ConfigureHttpJsonOptions(options =>
+	options.SerializerOptions.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)));
 
 builder.Services.AddSingleton(NpgsqlDataSource.Create(connectionString));
 

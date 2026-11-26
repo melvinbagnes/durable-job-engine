@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 using JobEngine.Jobs;
 using JobEngine.Scheduling;
 using JobEngine.Workflows;
@@ -16,11 +17,17 @@ public sealed class JobStore : IAsyncDisposable
 	private const long MigrationLockKey = 7_272_001;
 	private const int MaxErrorLength = 4000;
 
+	private static readonly Regex ChannelPattern = new("^[A-Za-z_][A-Za-z0-9_]{0,62}$", RegexOptions.Compiled);
+
 	private readonly NpgsqlDataSource _dataSource;
 	private readonly JobEngineOptions _options;
-	private readonly TimeProvider _time;
+	private readonly TimeProvider? _time;
 	private readonly bool _ownsDataSource;
 
+	/// <param name="time">
+	/// Null (the default) means every timestamp comes from the database server's clock, so workers with skewed
+	/// clocks agree on lease expiry and due times. Pass a TimeProvider only to control time in tests.
+	/// </param>
 	public JobStore(NpgsqlDataSource dataSource, JobEngineOptions options, TimeProvider? time = null)
 		: this(dataSource, options, time, ownsDataSource: false)
 	{
@@ -28,9 +35,16 @@ public sealed class JobStore : IAsyncDisposable
 
 	private JobStore(NpgsqlDataSource dataSource, JobEngineOptions options, TimeProvider? time, bool ownsDataSource)
 	{
+		if (!ChannelPattern.IsMatch(options.NotificationChannel))
+		{
+			throw new ArgumentException(
+				"NotificationChannel must be a plain identifier (letters, digits, underscore; at most 63 characters).",
+				nameof(options));
+		}
+
 		_dataSource = dataSource;
 		_options = options;
-		_time = time ?? TimeProvider.System;
+		_time = time;
 		_ownsDataSource = ownsDataSource;
 	}
 
@@ -50,7 +64,34 @@ public sealed class JobStore : IAsyncDisposable
 		}
 	}
 
-	private DateTime Now() => _time.GetUtcNow().UtcDateTime;
+	private async ValueTask<DateTime> NowAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken ct)
+	{
+		if (_time is not null)
+		{
+			return _time.GetUtcNow().UtcDateTime;
+		}
+
+		await using var command = new NpgsqlCommand("SELECT clock_timestamp();", connection, transaction);
+
+		return (DateTime)(await command.ExecuteScalarAsync(ct))!;
+	}
+
+	/// <summary>
+	/// Wakes idle workers. pg_notify inside a transaction is delivered on commit, so a job enqueued in the
+	/// caller's own transaction (outbox) wakes workers only if that transaction commits.
+	/// </summary>
+	private async Task NotifyAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken ct)
+	{
+		if (!_options.UseListenNotify)
+		{
+			return;
+		}
+
+		await using var command = new NpgsqlCommand("SELECT pg_notify(@channel, '');", connection, transaction)
+			.With("channel", NpgsqlDbType.Text, _options.NotificationChannel);
+
+		await command.ExecuteNonQueryAsync(ct);
+	}
 
 	// ---------------------------------------------------------------- schema
 
@@ -192,8 +233,10 @@ public sealed class JobStore : IAsyncDisposable
 	{
 		Validate(request);
 
-		var now = Now();
+		var now = await NowAsync(connection, transaction, ct);
 		var id = Guid.CreateVersion7();
+
+		Guid? createdId;
 
 		await using (var insert = new NpgsqlCommand(Sql.InsertJob, connection, transaction)
 			.With("id", NpgsqlDbType.Uuid, id)
@@ -207,10 +250,17 @@ public sealed class JobStore : IAsyncDisposable
 			.With("key", NpgsqlDbType.Text, request.IdempotencyKey)
 			.With("now", NpgsqlDbType.TimestampTz, now))
 		{
-			if (await insert.ExecuteScalarAsync(ct) is Guid createdId)
+			createdId = await insert.ExecuteScalarAsync(ct) as Guid?;
+		}
+
+		if (createdId is { } created)
+		{
+			if (initialState == JobState.Queued)
 			{
-				return new EnqueueResult(createdId, Created: true);
+				await NotifyAsync(connection, transaction, ct);
 			}
+
+			return new EnqueueResult(created, Created: true);
 		}
 
 		// Nothing was inserted, so the idempotency key already exists: hand back the original job.
@@ -256,9 +306,8 @@ public sealed class JobStore : IAsyncDisposable
 			return [];
 		}
 
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
 		await using var command = new NpgsqlCommand(Sql.Claim, connection)
 			.With("queues", NpgsqlDbType.Array | NpgsqlDbType.Text, queues.ToArray())
 			.With("now", NpgsqlDbType.TimestampTz, now)
@@ -288,9 +337,8 @@ public sealed class JobStore : IAsyncDisposable
 	/// <summary>Heartbeat. Returns false when the lease was lost (expired and reclaimed, or the job finished).</summary>
 	public async Task<bool> ExtendLeaseAsync(Guid id, Guid leaseToken, TimeSpan leaseDuration, CancellationToken ct = default)
 	{
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
 		await using var command = new NpgsqlCommand(Sql.ExtendLease, connection)
 			.With("id", NpgsqlDbType.Uuid, id)
 			.With("token", NpgsqlDbType.Uuid, leaseToken)
@@ -303,10 +351,9 @@ public sealed class JobStore : IAsyncDisposable
 	/// <summary>Marks the job succeeded and releases dependents. Fenced by the lease token.</summary>
 	public async Task<bool> CompleteAsync(Guid id, Guid leaseToken, CancellationToken ct = default)
 	{
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
 		await using var transaction = await connection.BeginTransactionAsync(ct);
+		var now = await NowAsync(connection, transaction, ct);
 
 		int updated;
 
@@ -331,11 +378,18 @@ public sealed class JobStore : IAsyncDisposable
 			await lockDependents.ExecuteNonQueryAsync(ct);
 		}
 
+		int promoted;
+
 		await using (var promote = new NpgsqlCommand(Sql.PromoteDependents, connection, transaction)
 			.With("id", NpgsqlDbType.Uuid, id)
 			.With("now", NpgsqlDbType.TimestampTz, now))
 		{
-			await promote.ExecuteNonQueryAsync(ct);
+			promoted = await promote.ExecuteNonQueryAsync(ct);
+		}
+
+		if (promoted > 0)
+		{
+			await NotifyAsync(connection, transaction, ct);
 		}
 
 		await transaction.CommitAsync(ct);
@@ -356,10 +410,9 @@ public sealed class JobStore : IAsyncDisposable
 		TimeSpan retryDelay,
 		CancellationToken ct = default)
 	{
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
 		await using var transaction = await connection.BeginTransactionAsync(ct);
+		var now = await NowAsync(connection, transaction, ct);
 
 		FailureOutcome? outcome = null;
 
@@ -400,21 +453,29 @@ public sealed class JobStore : IAsyncDisposable
 	public async Task<bool> ReleaseAsync(Guid id, Guid leaseToken, CancellationToken ct = default)
 	{
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
+
 		await using var command = new NpgsqlCommand(Sql.Release, connection)
 			.With("id", NpgsqlDbType.Uuid, id)
 			.With("token", NpgsqlDbType.Uuid, leaseToken)
-			.With("now", NpgsqlDbType.TimestampTz, Now());
+			.With("now", NpgsqlDbType.TimestampTz, now);
 
-		return await command.ExecuteNonQueryAsync(ct) == 1;
+		var released = await command.ExecuteNonQueryAsync(ct) == 1;
+
+		if (released)
+		{
+			await NotifyAsync(connection, null, ct);
+		}
+
+		return released;
 	}
 
 	/// <summary>Dead-letter replay: resets attempts and revives the canceled downstream steps.</summary>
 	public async Task<bool> RequeueDeadAsync(Guid id, CancellationToken ct = default)
 	{
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
 		await using var transaction = await connection.BeginTransactionAsync(ct);
+		var now = await NowAsync(connection, transaction, ct);
 
 		int updated;
 
@@ -439,6 +500,8 @@ public sealed class JobStore : IAsyncDisposable
 			await revive.ExecuteNonQueryAsync(ct);
 		}
 
+		await NotifyAsync(connection, transaction, ct);
+
 		await transaction.CommitAsync(ct);
 
 		return true;
@@ -450,10 +513,9 @@ public sealed class JobStore : IAsyncDisposable
 	/// </summary>
 	public async Task<int> ReapExhaustedAsync(CancellationToken ct = default)
 	{
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
 		await using var transaction = await connection.BeginTransactionAsync(ct);
+		var now = await NowAsync(connection, transaction, ct);
 
 		var reaped = new List<Guid>();
 
@@ -482,8 +544,10 @@ public sealed class JobStore : IAsyncDisposable
 	public async Task<int> PurgeAsync(TimeSpan olderThan, CancellationToken ct = default)
 	{
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
+
 		await using var command = new NpgsqlCommand(Sql.Purge, connection)
-			.With("cutoff", NpgsqlDbType.TimestampTz, Now() - olderThan);
+			.With("cutoff", NpgsqlDbType.TimestampTz, now - olderThan);
 
 		return await command.ExecuteNonQueryAsync(ct);
 	}
@@ -562,11 +626,13 @@ public sealed class JobStore : IAsyncDisposable
 		ArgumentException.ThrowIfNullOrWhiteSpace(definition.Type);
 
 		var cron = CronExpression.Parse(definition.Cron);
-		var now = Now();
-		var next = cron.GetNextOccurrence(now)
-			?? throw new InvalidOperationException($"Cron expression '{definition.Cron}' never fires.");
+		var timeZone = TimeZones.Resolve(definition.TimeZone);
 
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
+		var next = cron.GetNextOccurrence(now, timeZone)
+			?? throw new InvalidOperationException($"Cron expression '{definition.Cron}' never fires.");
+
 		await using var command = new NpgsqlCommand(Sql.UpsertSchedule, connection)
 			.With("name", NpgsqlDbType.Text, definition.Name)
 			.With("cron", NpgsqlDbType.Text, cron.Expression)
@@ -574,7 +640,8 @@ public sealed class JobStore : IAsyncDisposable
 			.With("job_type", NpgsqlDbType.Text, definition.Type)
 			.With("payload", NpgsqlDbType.Jsonb, definition.PayloadJson)
 			.With("max_attempts", NpgsqlDbType.Integer, definition.MaxAttempts ?? _options.DefaultMaxAttempts)
-			.With("next_run_at", NpgsqlDbType.TimestampTz, next);
+			.With("next_run_at", NpgsqlDbType.TimestampTz, next)
+			.With("time_zone", NpgsqlDbType.Text, timeZone is null ? null : definition.TimeZone);
 
 		await command.ExecuteNonQueryAsync(ct);
 	}
@@ -586,10 +653,9 @@ public sealed class JobStore : IAsyncDisposable
 	/// </summary>
 	public async Task<int> FireDueSchedulesAsync(int maxSchedules = 50, CancellationToken ct = default)
 	{
-		var now = Now();
-
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
 		await using var transaction = await connection.BeginTransactionAsync(ct);
+		var now = await NowAsync(connection, transaction, ct);
 
 		var due = new List<DueSchedule>();
 
@@ -608,7 +674,8 @@ public sealed class JobStore : IAsyncDisposable
 					reader.GetString(3),
 					reader.GetString(4),
 					reader.GetInt32(5),
-					reader.GetFieldValue<DateTime>(6)));
+					reader.GetFieldValue<DateTime>(6),
+					reader.IsDBNull(7) ? null : reader.GetString(7)));
 			}
 		}
 
@@ -630,7 +697,7 @@ public sealed class JobStore : IAsyncDisposable
 				JobState.Queued,
 				ct);
 
-			var next = CronExpression.Parse(schedule.Cron).GetNextOccurrence(now);
+			var next = CronExpression.Parse(schedule.Cron).GetNextOccurrence(now, TimeZones.Resolve(schedule.TimeZone));
 
 			await using var advance = new NpgsqlCommand(Sql.AdvanceSchedule, connection, transaction)
 				.With("name", NpgsqlDbType.Text, schedule.Name)
@@ -652,7 +719,8 @@ public sealed class JobStore : IAsyncDisposable
 		string JobType,
 		string PayloadJson,
 		int MaxAttempts,
-		DateTime NextRunAt);
+		DateTime NextRunAt,
+		string? TimeZone);
 }
 
 internal static class NpgsqlCommandExtensions

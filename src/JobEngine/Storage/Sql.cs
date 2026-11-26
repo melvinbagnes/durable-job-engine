@@ -50,8 +50,11 @@ internal static class Sql
 			max_attempts integer NOT NULL,
 			enabled boolean NOT NULL DEFAULT true,
 			next_run_at timestamptz NOT NULL,
-			last_run_at timestamptz NULL
+			last_run_at timestamptz NULL,
+			time_zone text NULL
 		);
+
+		ALTER TABLE schedules ADD COLUMN IF NOT EXISTS time_zone text NULL;
 		""";
 
 	public const string InsertJob = """
@@ -227,20 +230,25 @@ internal static class Sql
 	public const string Stats = "SELECT state, count(*) FROM jobs GROUP BY state;";
 
 	public const string UpsertSchedule = """
-		INSERT INTO schedules (name, cron, queue, job_type, payload, max_attempts, enabled, next_run_at)
-		VALUES (@name, @cron, @queue, @job_type, @payload, @max_attempts, true, @next_run_at)
+		INSERT INTO schedules (name, cron, queue, job_type, payload, max_attempts, enabled, next_run_at, time_zone)
+		VALUES (@name, @cron, @queue, @job_type, @payload, @max_attempts, true, @next_run_at, @time_zone)
 		ON CONFLICT (name) DO UPDATE
 		SET cron = EXCLUDED.cron,
+			time_zone = EXCLUDED.time_zone,
 			queue = EXCLUDED.queue,
 			job_type = EXCLUDED.job_type,
 			payload = EXCLUDED.payload,
 			max_attempts = EXCLUDED.max_attempts,
 			enabled = true,
-			next_run_at = CASE WHEN schedules.cron = EXCLUDED.cron THEN schedules.next_run_at ELSE EXCLUDED.next_run_at END;
+			next_run_at = CASE
+				WHEN schedules.cron = EXCLUDED.cron AND schedules.time_zone IS NOT DISTINCT FROM EXCLUDED.time_zone
+				THEN schedules.next_run_at
+				ELSE EXCLUDED.next_run_at
+			END;
 		""";
 
 	public const string SelectDueSchedules = """
-		SELECT name, cron, queue, job_type, payload::text, max_attempts, next_run_at
+		SELECT name, cron, queue, job_type, payload::text, max_attempts, next_run_at, time_zone
 		FROM schedules
 		WHERE enabled AND next_run_at <= @now
 		ORDER BY next_run_at
