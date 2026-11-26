@@ -15,9 +15,11 @@ using Npgsql;
 
 const int WorkerConcurrency = 12;
 
-if (args.Length >= 2 && args[0] == "worker")
+var role = Environment.GetEnvironmentVariable("SOAK_ROLE");
+
+if (role == "worker")
 {
-	return await RunWorker(args[1]);
+	return await RunWorker(Environment.GetEnvironmentVariable("SOAK_WORKER_ID")!);
 }
 
 return await RunOrchestrator();
@@ -129,9 +131,15 @@ static async Task<int> RunOrchestrator()
 	Process Spawn()
 	{
 		var info = new ProcessStartInfo(host) { UseShellExecute = false };
-		info.ArgumentList.Add(assembly);
-		info.ArgumentList.Add("worker");
-		info.ArgumentList.Add($"worker-{++spawned}");
+
+		// Started through the dotnet muxer the dll is an argument; started through the apphost it is not.
+		if (string.Equals(Path.GetFileNameWithoutExtension(host), "dotnet", StringComparison.OrdinalIgnoreCase))
+		{
+			info.ArgumentList.Add(assembly);
+		}
+
+		info.Environment["SOAK_ROLE"] = "worker";
+		info.Environment["SOAK_WORKER_ID"] = $"worker-{++spawned}";
 		info.Environment["SOAK_SCHEMA"] = schema;
 		info.Environment["JOBENGINE_TEST_CONNECTION"] = admin;
 
