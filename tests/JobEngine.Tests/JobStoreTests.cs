@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using JobEngine.Jobs;
 using JobEngine.Scheduling;
+using JobEngine.Storage;
 using JobEngine.Workflows;
 using Xunit;
 
@@ -161,7 +162,7 @@ public class JobStoreTests : PostgresTestBase
 		var results = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ =>
 			Store.EnqueueAsync(new EnqueueRequest { Type = "once", IdempotencyKey = "same-key" })));
 
-		Assert.Single(results.Where(r => r.Created));
+		Assert.Single(results, r => r.Created);
 		Assert.Single(results.Select(r => r.JobId).Distinct());
 		Assert.Equal(1L, await ScalarAsync<long>("SELECT count(*) FROM jobs"));
 	}
