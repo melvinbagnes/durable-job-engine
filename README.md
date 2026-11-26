@@ -19,6 +19,10 @@ It exists to answer one question properly: **what has to be true for a job queue
 | **Instant wake-up** | PostgreSQL `LISTEN/NOTIFY` wakes idle workers the moment a job becomes runnable; polling stays as a backstop |
 | **One clock** | Leases, delays and cron slots are all timed by the database server's clock, so skewed worker clocks cannot disagree |
 | **Cron schedules** | 5-field cron in UTC or any IANA time zone, with defined DST behaviour; safe with many scheduler processes, one job per slot |
+| **Per-job timeout** | `EnqueueRequest.Timeout` or `DefaultJobTimeout`; the handler's token is cancelled and the attempt counts as failed (retried with backoff) |
+| **Queue limits** | Cluster-wide concurrency cap and token-bucket rate limit per queue, shared by every worker process |
+| **Archive** | Old succeeded jobs move to `job_archive` so the hot `jobs` table stays small; `GetAsync` still finds them |
+| **Metrics and tracing** | `System.Diagnostics.Metrics` counters/histogram and one `ActivitySource` span per execution, so OpenTelemetry can pick them up |
 | **Graceful shutdown** | In-flight jobs are released back to the queue without spending an attempt |
 
 ## Architecture
@@ -103,6 +107,14 @@ stateDiagram-v2
 
 Both are covered by tests against `America/New_York` on the 2026 transition dates. Zone data comes from the operating system, so a container image without `tzdata` fails at startup with `TimeZoneNotFoundException` instead of silently running at the wrong hour.
 
+**Timeouts.** A job's timeout cancels the token passed to its handler; a handler that honours the token stops, and the attempt is recorded as failed with a `TimeoutException`. A handler that ignores the token cannot be killed in .NET, so after `TimeoutGrace` the engine abandons it (it keeps running in the background) and frees the worker slot. Handlers that can run long should therefore pass the token into everything they await.
+
+**Queue limits.** `QueueLimit(MaxConcurrency, MaxPerSecond, Burst)` is enforced in the database, not in each worker: a limited queue is claimed under a per-queue `pg_advisory_xact_lock`, live (unexpired) leases are counted against the cap, and the rate limit is a token bucket stored in `queue_limits`. That makes the limits cluster-wide, at the cost of serialising claims on a limited queue.
+
+**Archive.** With `ArchiveAfter` set, succeeded jobs older than that move to `job_archive` in batches, which keeps the hot table and its partial indexes small. Dead and canceled jobs stay in `jobs` so they can be inspected and replayed, and a job with unfinished children is never archived. I chose this over declarative partitioning of `jobs`: the claim path needs a global unique idempotency index, which PostgreSQL cannot enforce across partitions without putting the partition key in it.
+
+**Telemetry.** Meter and ActivitySource are both named `JobEngine`. Metrics: `jobengine.jobs.enqueued`, `jobengine.jobs.processed` (tag `outcome`: succeeded, retried, dead, timed_out, released, lease_lost) and `jobengine.job.duration` (ms). Each execution is one span, `job process`, tagged with job id, type, queue, attempt and outcome. With OpenTelemetry: `.AddMeter("JobEngine")` and `.AddSource("JobEngine")`.
+
 ## Quick start
 
 ```bash
@@ -140,6 +152,12 @@ builder.Services
     .AddHandler("cache.warm", (ctx, ct) => WarmAsync(ct))            // or a delegate
     .AddRecurring(new RecurringJobDefinition("nightly", "0 3 * * *", "report.generate"));
 
+// Optional: timeouts, per-queue limits, archive (all off by default)
+options.DefaultJobTimeout = TimeSpan.FromMinutes(5);
+options.QueueLimits["emails"] = new QueueLimit(MaxConcurrency: 10, MaxPerSecond: 50);
+options.ArchiveAfter = TimeSpan.FromDays(7);
+options.ArchiveRetention = TimeSpan.FromDays(90);
+
 // Anywhere (an API process can run with EnableWorker = false)
 await store.EnqueueAsync(new EnqueueRequest { Type = "email.send", IdempotencyKey = $"welcome:{userId}" });
 
@@ -156,7 +174,7 @@ await store.EnqueueWorkflowAsync(
 
 ## Tests
 
-104 tests. `dotnet test` needs a PostgreSQL server (`JOBENGINE_TEST_CONNECTION`, default `postgres/postgres@localhost:5432`); `docker compose up -d db` provides one. Each test gets its own schema. Store tests use a fake clock so leases, backoff and cron slots can be fast-forwarded; worker tests run the real hosted services with the real clock.
+117 tests. `dotnet test` needs a PostgreSQL server (`JOBENGINE_TEST_CONNECTION`, default `postgres/postgres@localhost:5432`); `docker compose up -d db` provides one. Each test gets its own schema. Store tests use a fake clock so leases, backoff and cron slots can be fast-forwarded; worker tests run the real hosted services with the real clock.
 
 | What is proven | Test |
 |---|---|
@@ -176,28 +194,65 @@ await store.EnqueueWorkflowAsync(
 | NOTIFY also fires when a dependency completes, and only after an outbox transaction commits | `Notify_WakesTheWorkerWhenADependencyCompletes`, `Notify_FromACallersTransaction_*` |
 | Delayed jobs still run on time through the polling backstop | `DelayedJob_RunsOnceDue_EvenWithNoNotificationForIt` |
 | Timestamps come from the database clock | `DatabaseClockTests` |
+| A cooperative handler is cancelled at its timeout and retried; a handler that ignores its token is abandoned and its slot freed | `Timeout_CancelsACooperativeHandler_ThenRetries`, `Timeout_AbandonsAHandlerThatIgnoresItsToken_AndFreesTheSlot`, `DefaultJobTimeout_AppliesToJobsThatSetNone` |
+| A queue cap holds under many concurrent claimers and across all slots; expired leases do not count; the rate limit follows the clock | `QueueLimit_*` |
+| Archiving keeps jobs readable, leaves dead and unfinished jobs alone, respects the batch size | `Archive_*` |
+| One metric per outcome and one span per execution | `Telemetry_RecordsEnqueueAndOutcomeMetrics_AndOneSpanPerExecution` |
 | Cron parsing and next-occurrence maths, retry maths, DAG validation | `CronExpressionTests`, `RetryPolicyTests`, `WorkflowGraphTests` |
 
 ## Benchmarks
 
-`benchmarks/JobEngine.Benchmarks` runs in CI against PostgreSQL 16 and writes its table to the job summary. The run these numbers come from (GitHub-hosted runner, 4 logical cores, PostgreSQL and workers on the same machine, 20,000 jobs per throughput run, no-op handler):
+`benchmarks/JobEngine.Benchmarks` runs in CI against PostgreSQL 16 and writes its table to the job summary. The numbers below are from one CI run (GitHub-hosted runner, 4 logical cores, PostgreSQL and workers on the same machine, 20,000 jobs per throughput run, no-op handler):
 
-| Measurement | Result |
-|---|---|
-| Enqueue, 8 parallel producers | 5,425 jobs/s |
-| Drain, 1 worker, concurrency 16 | 1,001 jobs/s |
-| Drain, 4 workers x concurrency 16 | 1,418 jobs/s |
+| Measurement | Result | Range over the CI runs I looked at |
+|---|---|---|
+| Enqueue, 8 parallel producers | 3,630 jobs/s | 3,328 to 5,425 |
+| Drain, 1 worker, concurrency 16 | 663 jobs/s | 640 to 1,001 |
+| Drain, 4 workers x concurrency 16 | 908 jobs/s | 871 to 1,418 |
 
 Idle-to-running latency (job enqueued while the worker is idle, poll interval 1 s, 100 samples with NOTIFY and 30 with polling only):
 
 | Mode | p50 | p95 | max |
 |---|---|---|---|
-| LISTEN/NOTIFY | 2 ms | 3 ms | 10 ms |
-| Polling only | 821 ms | 939 ms | 940 ms |
+| LISTEN/NOTIFY | 3 ms | 3 ms | 5 ms |
+| Polling only | 821 ms | 938 ms | 941 ms |
 
-How to read these: the database and all workers share four cores, so four workers are only about 1.4x faster than one; the database is the bottleneck, which is the design's expected limit. Absolute numbers on a shared CI runner vary from run to run and say nothing about dedicated hardware. They are a measured floor for a no-op handler, not a capacity claim, and I did not compare against other queues.
+The database and all workers share four cores, so four workers are only about 1.4x faster than one: the database is the bottleneck, which is the design's expected limit. Shared CI runners vary a lot from run to run (see the ranges), so treat these as a measured floor for a no-op handler, not a capacity claim.
 
-Run it yourself: `JOBENGINE_TEST_CONNECTION=... dotnet run -c Release --project benchmarks/JobEngine.Benchmarks`.
+### Against Hangfire
+
+`benchmarks/JobEngine.Compare` runs the same workload against Hangfire 1.8 with Hangfire.PostgreSql on the same machine and database: 20,000 no-op jobs, 8 producers, 16 Hangfire workers.
+
+| | This engine | Hangfire + PostgreSQL |
+|---|---|---|
+| Enqueue, 8 producers | 3,630 jobs/s | 1,095 jobs/s |
+| Drain, no-op job | 663 jobs/s (1 worker, concurrency 16) | 386 jobs/s (16 workers) |
+
+In the two runs where both were measured side by side, this engine enqueued about 3.3x faster and drained 1.7x to 2.4x faster. Read that with the caveats in mind: Hangfire runs at its default 1 s queue poll, its "executed" counter is incremented inside the job so its final state write is outside the timing (which flatters Hangfire), the two serialise payloads differently, and Hangfire does a lot this engine does not (a dashboard, continuations, batches, years of production use). It shows the design is not slower than the established option on this workload, not that it is a replacement for it.
+
+I did not benchmark Quartz.NET on purpose: it is a scheduler, not a work queue, so a throughput comparison would measure the wrong thing. If you need a cron-like schedule, the comparable pieces are Quartz triggers and this engine's `AddRecurring`.
+
+Run it yourself: `JOBENGINE_TEST_CONNECTION=... dotnet run -c Release --project benchmarks/JobEngine.Benchmarks` (or `.Compare`).
+
+## Chaos soak
+
+`benchmarks/JobEngine.Soak` is the proof under failure rather than load. It starts four real worker **processes** (12 concurrent jobs each, 3 s leases), enqueues 30,000 jobs, and every 2.5 s kills one with SIGKILL (no graceful shutdown, no lease release) and starts a replacement. Handlers write a row per execution and 3% of first attempts fail on purpose. It passes only if every job ends `succeeded`, none is lost, stuck or never ran, and every completion has a timestamp. CI runs it on every push.
+
+Result of the CI run the other numbers come from:
+
+| Check | Result |
+|---|---|
+| Jobs succeeded | 30,000 of 30,000 |
+| Jobs lost, stuck, dead or canceled; jobs that never ran | 0; 0 |
+| Worker processes killed | 29 |
+| Handler executions | 30,998 (929 are retries of the injected failures) |
+| Duplicate executions because the earlier worker was killed | 69 (a kill can strand at most 12 jobs: at most 348) |
+| Duplicate executions while the earlier worker was alive | 0 |
+| Wall time | 80 s (373 jobs/s under chaos) |
+
+What this does and does not show. A killed worker's jobs ran twice when it died after the handler but before the outcome was recorded; the lease expired and another worker re-ran them. That is at-least-once delivery working as designed, which is why handlers must be idempotent. Nothing was lost.
+
+**A failure of my own harness is worth recording.** My first soak runs showed far more repeats than the kills could explain (for example 548 repeats in a run with 26 kills, where 26 x 12 = 312 is the most a kill can strand). I added a log table to the workers and found `PostgresException 53300: sorry, too many clients already`: four workers with oversized connection pools had exhausted PostgreSQL's `max_connections` (100), so completions could not be recorded, leases expired, and jobs re-ran while their worker was alive. The engine behaved as documented (an outcome it cannot record is left to the lease), but it is a real operational lesson: **size connection pools so that all processes together stay under `max_connections`**. The same failure, reproduced on purpose in CI as a labelled diagnostic step (10,000 jobs, pools of 24 and 16), looks like this: 304 "could not record the outcome" errors and 156 live-worker repeats. With sensible pools the live-worker repeats are 0.
 
 ## Layout
 
@@ -205,13 +260,15 @@ Run it yourself: `JOBENGINE_TEST_CONNECTION=... dotnet run -c Release --project 
 src/JobEngine/            the library
   Storage/Sql.cs          every statement, in one reviewable file
   Storage/JobStore.cs     state transitions (each one a statement or a short transaction)
-  Runtime/                JobWorker (claim loop), JobProcessor (handler + heartbeat), SchedulerService,
-                          JobNotificationListener + WakeSignal (LISTEN/NOTIFY)
+  Runtime/                JobWorker (claim loop), JobProcessor (handler + heartbeat + timeout), SchedulerService,
+                          JobNotificationListener + WakeSignal (LISTEN/NOTIFY), JobEngineTelemetry
   Scheduling/             CronExpression (UTC and time zones), RetryPolicy
   Workflows/              DAG validation
 src/JobEngine.Demo/       minimal API: jobs, workflows, outbox, stats, replay
 tests/JobEngine.Tests/    unit tests + PostgreSQL integration tests
-benchmarks/               throughput and wake-up latency benchmark (runs in CI)
+benchmarks/Benchmarks     throughput and wake-up latency (runs in CI)
+benchmarks/Compare        the same workload against Hangfire (runs in CI)
+benchmarks/Soak           chaos test with real worker processes killed by SIGKILL (runs in CI)
 scripts/smoke.sh          end-to-end check of the demo API against docker compose
 ```
 
@@ -223,9 +280,13 @@ What is still not covered, stated plainly:
 - **LISTEN needs a session-level connection.** Through PgBouncer in transaction-pooling mode, `LISTEN` does not work; point `ConnectionString` at PostgreSQL directly or set `UseListenNotify = false` and accept polling latency. Channels are database-wide, so give environments that share a database different `NotificationChannel` values.
 - **The database clock is the single source of time**, which assumes one writable primary. It removes worker clock skew; it does not help if you fail over to a replica whose clock is badly off.
 - **Cron has minute resolution** and no seconds field. DST behaviour is the two rules above, not a configurable policy.
-- **No per-job timeout or rate limiting.** A handler that never returns holds its slot; the heartbeat keeps its lease alive. Pass the supplied `CancellationToken` into everything you await.
-- **Throughput is bounded by PostgreSQL** (see the benchmark). For hundreds of thousands of jobs per minute use a log-based broker.
-- **One `jobs` table.** No partitioning; use `CompletedRetention` to keep it small.
+- **A timeout cannot kill a handler that ignores its `CancellationToken`.** .NET cannot stop a running task. After `TimeoutGrace` the engine abandons it and frees the slot, but the code keeps running in the background. Pass the token into everything you await.
+- **Rate limits have `PollInterval` granularity** and limited queues serialise their claims (advisory lock per queue), so a limited queue gives up some throughput for the guarantee.
+- **The archive moves only succeeded jobs** and releases their idempotency keys, so a key can be reused after archiving. Dead and canceled jobs stay in `jobs`. It is an archive table, not partitioning: if you need to drop data by time range cheaply at very large scale, partition `jobs` yourself.
+- **Trace context is not propagated from enqueue to execution.** Each execution is its own span; there is no parent link to the request that enqueued it, and no queue-depth gauge yet.
+- **Delivery is at-least-once, and duplicates happen.** A worker killed between running a handler and recording its outcome, or one that cannot reach the database for longer than its lease (for example when connections run out, see the soak section), makes the job run again. Handlers must be idempotent.
+- **Throughput is bounded by PostgreSQL** (see the benchmarks). For hundreds of thousands of jobs per minute use a log-based broker.
+- **The numbers come from shared CI runners only.** They vary by up to 1.5x between runs, I have not run this against dedicated hardware, and it has not been used in production.
 - **Verified on PostgreSQL 16 on Linux only.** The tests, benchmark and docker smoke test all run there; other versions and Windows are untested.
 
 ## License
