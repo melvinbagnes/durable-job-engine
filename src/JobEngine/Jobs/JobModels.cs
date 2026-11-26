@@ -40,6 +40,9 @@ public sealed class EnqueueRequest
 
 	public TimeSpan Delay { get; init; }
 
+	/// <summary>Overrides <see cref="JobEngineOptions.DefaultJobTimeout"/> for this job.</summary>
+	public TimeSpan? Timeout { get; init; }
+
 	public int? MaxAttempts { get; init; }
 
 	/// <summary>When set, enqueueing the same key again returns the original job instead of creating a duplicate.</summary>
@@ -71,7 +74,8 @@ public sealed record ClaimedJob(
 	string PayloadJson,
 	int Attempts,
 	int MaxAttempts,
-	Guid LeaseToken);
+	Guid LeaseToken,
+	int? TimeoutMs = null);
 
 public sealed record FailureOutcome(JobState State, DateTime RunAt);
 

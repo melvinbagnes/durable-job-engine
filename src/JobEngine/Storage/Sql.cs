@@ -20,8 +20,11 @@ internal static class Sql
 			idempotency_key text NULL,
 			created_at timestamptz NOT NULL,
 			updated_at timestamptz NOT NULL,
-			completed_at timestamptz NULL
+			completed_at timestamptz NULL,
+			timeout_ms integer NULL
 		);
+
+		ALTER TABLE jobs ADD COLUMN IF NOT EXISTS timeout_ms integer NULL;
 
 		CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_idempotency
 			ON jobs (idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -55,11 +58,22 @@ internal static class Sql
 		);
 
 		ALTER TABLE schedules ADD COLUMN IF NOT EXISTS time_zone text NULL;
+
+		CREATE TABLE IF NOT EXISTS job_archive (LIKE jobs INCLUDING DEFAULTS);
+
+		CREATE INDEX IF NOT EXISTS ix_job_archive_id ON job_archive (id);
+		CREATE INDEX IF NOT EXISTS ix_job_archive_completed ON job_archive (completed_at);
+
+		CREATE TABLE IF NOT EXISTS queue_limits (
+			queue text PRIMARY KEY,
+			tokens double precision NOT NULL,
+			updated_at timestamptz NOT NULL
+		);
 		""";
 
 	public const string InsertJob = """
-		INSERT INTO jobs (id, queue, type, payload, state, priority, run_at, attempts, max_attempts, idempotency_key, created_at, updated_at)
-		VALUES (@id, @queue, @type, @payload, @state, @priority, @run_at, 0, @max_attempts, @key, @now, @now)
+		INSERT INTO jobs (id, queue, type, payload, state, priority, run_at, attempts, max_attempts, idempotency_key, created_at, updated_at, timeout_ms)
+		VALUES (@id, @queue, @type, @payload, @state, @priority, @run_at, 0, @max_attempts, @key, @now, @now, @timeout_ms)
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING id;
 		""";
@@ -95,8 +109,57 @@ internal static class Sql
 			updated_at = @now
 		FROM candidates c
 		WHERE j.id = c.id
-		RETURNING j.id, j.queue, j.type, j.payload::text, j.attempts, j.max_attempts, j.lease_token;
+		RETURNING j.id, j.queue, j.type, j.payload::text, j.attempts, j.max_attempts, j.lease_token, j.timeout_ms;
 		""";
+
+	public const string CountRunning = "SELECT count(*) FROM jobs WHERE queue = @queue AND state = 'running' AND lease_expires_at > @now;";
+
+	public const string EnsureQueueLimit = "INSERT INTO queue_limits (queue, tokens, updated_at) VALUES (@queue, @tokens, @now) ON CONFLICT (queue) DO NOTHING;";
+
+	public const string LockQueueLimit = "SELECT tokens, updated_at FROM queue_limits WHERE queue = @queue FOR UPDATE;";
+
+	public const string SaveQueueLimit = "UPDATE queue_limits SET tokens = @tokens, updated_at = @now WHERE queue = @queue;";
+
+	public const string SelectArchivedJob = """
+		SELECT id, queue, type, payload::text, state, priority, run_at, attempts, max_attempts,
+			   last_error, idempotency_key, created_at, completed_at
+		FROM job_archive
+		WHERE id = @id
+		LIMIT 1;
+		""";
+
+	public const string ArchiveFinished = """
+		WITH moved AS (
+			DELETE FROM jobs j
+			WHERE j.id IN (
+					SELECT id FROM jobs
+					WHERE state = 'succeeded' AND completed_at < @cutoff
+					ORDER BY completed_at
+					LIMIT @batch
+					FOR UPDATE SKIP LOCKED)
+			  AND NOT EXISTS (
+					SELECT 1
+					FROM job_dependencies d
+					JOIN jobs c ON c.id = d.job_id
+					WHERE d.depends_on_id = j.id AND c.state IN ('waiting', 'queued', 'running'))
+			RETURNING j.id, j.queue, j.type, j.payload, j.state, j.priority, j.run_at, j.attempts, j.max_attempts,
+					  j.lease_token, j.lease_owner, j.lease_expires_at, j.last_error, j.idempotency_key,
+					  j.created_at, j.updated_at, j.completed_at, j.timeout_ms
+		),
+		archived AS (
+			INSERT INTO job_archive (id, queue, type, payload, state, priority, run_at, attempts, max_attempts,
+									 lease_token, lease_owner, lease_expires_at, last_error, idempotency_key,
+									 created_at, updated_at, completed_at, timeout_ms)
+			SELECT id, queue, type, payload, state, priority, run_at, attempts, max_attempts,
+				   lease_token, lease_owner, lease_expires_at, last_error, idempotency_key,
+				   created_at, updated_at, completed_at, timeout_ms
+			FROM moved
+			RETURNING 1
+		)
+		SELECT count(*) FROM archived;
+		""";
+
+	public const string PurgeArchive = "DELETE FROM job_archive WHERE completed_at < @cutoff;";
 
 	public const string ExtendLease = """
 		UPDATE jobs

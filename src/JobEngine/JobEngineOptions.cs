@@ -2,6 +2,11 @@ using JobEngine.Scheduling;
 
 namespace JobEngine;
 
+/// <param name="MaxConcurrency">Most jobs of this queue running at once across all processes.</param>
+/// <param name="MaxPerSecond">Sustained start rate across all processes (token bucket).</param>
+/// <param name="Burst">Bucket size; defaults to MaxPerSecond rounded up (at least 1).</param>
+public sealed record QueueLimit(int? MaxConcurrency = null, double? MaxPerSecond = null, int? Burst = null);
+
 public sealed class JobEngineOptions
 {
 	public string ConnectionString { get; set; } = "";
@@ -40,6 +45,32 @@ public sealed class JobEngineOptions
 
 	/// <summary>When set, finished jobs older than this are deleted (their idempotency keys are released with them).</summary>
 	public TimeSpan? CompletedRetention { get; set; }
+
+	/// <summary>
+	/// Applied to jobs that do not set their own <see cref="Jobs.EnqueueRequest.Timeout"/>. Null means no timeout.
+	/// On timeout the handler's CancellationToken is canceled and the attempt counts as failed (it is retried
+	/// under the usual backoff). A handler that ignores its token cannot be killed: after
+	/// <see cref="TimeoutGrace"/> it is abandoned (it keeps running in the background) so the slot is freed.
+	/// </summary>
+	public TimeSpan? DefaultJobTimeout { get; set; }
+
+	public TimeSpan TimeoutGrace { get; set; } = TimeSpan.FromSeconds(5);
+
+	/// <summary>
+	/// When set, succeeded jobs older than this move from <c>jobs</c> to <c>job_archive</c>, which keeps the hot
+	/// table (and its indexes) small. Their idempotency keys are released with them. Dead and canceled jobs
+	/// stay in <c>jobs</c> so they can be inspected and replayed.
+	/// </summary>
+	public TimeSpan? ArchiveAfter { get; set; }
+
+	/// <summary>When set, archived jobs older than this are deleted for good.</summary>
+	public TimeSpan? ArchiveRetention { get; set; }
+
+	/// <summary>
+	/// Cluster-wide limits per queue, shared by every worker process. A queue that is not listed is unlimited.
+	/// Limited queues are claimed under a per-queue advisory lock, which serialises their claims.
+	/// </summary>
+	public Dictionary<string, QueueLimit> QueueLimits { get; } = new();
 
 	public bool AutoMigrate { get; set; } = true;
 

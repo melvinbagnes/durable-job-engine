@@ -632,4 +632,151 @@ public class JobStoreTests : PostgresTestBase
 
 		Assert.Throws<ArgumentException>(() => JobStore.Create(options));
 	}
+
+	// ------------------------------------------------------------ archive
+
+	[Fact]
+	public async Task Archive_MovesOldSucceededJobs_ButKeepsThemReadable()
+	{
+		var id = (await Store.EnqueueAsync(new EnqueueRequest { Type = "done", IdempotencyKey = "once" })).JobId;
+		var claimed = Assert.Single(await ClaimAsync());
+		await Store.CompleteAsync(claimed.Id, claimed.LeaseToken);
+
+		Clock.Advance(TimeSpan.FromMinutes(30));
+		Assert.Equal(0, await Store.ArchiveAsync(TimeSpan.FromHours(1)));
+
+		Clock.Advance(TimeSpan.FromHours(1));
+		Assert.Equal(1, await Store.ArchiveAsync(TimeSpan.FromHours(1)));
+
+		Assert.Equal(0L, await ScalarAsync<long>("SELECT count(*) FROM jobs"));
+		Assert.Equal(1L, await ScalarAsync<long>("SELECT count(*) FROM job_archive"));
+		Assert.Equal(JobState.Succeeded, (await GetJobAsync(id)).State);
+
+		// The key was released with the hot row, as documented.
+		Assert.True((await Store.EnqueueAsync(new EnqueueRequest { Type = "done", IdempotencyKey = "once" })).Created);
+	}
+
+	[Fact]
+	public async Task Archive_LeavesDeadAndUnfinishedJobsAlone()
+	{
+		await Store.EnqueueAsync(new EnqueueRequest { Type = "dead", MaxAttempts = 1 });
+		var claimed = Assert.Single(await ClaimAsync());
+		await Store.FailAsync(claimed.Id, claimed.LeaseToken, "boom", permanent: true, retryDelay: TimeSpan.Zero);
+		await Store.EnqueueAsync(Job("waiting-in-line"));
+
+		Clock.Advance(TimeSpan.FromDays(2));
+
+		Assert.Equal(0, await Store.ArchiveAsync(TimeSpan.FromHours(1)));
+		Assert.Equal(2L, await ScalarAsync<long>("SELECT count(*) FROM jobs"));
+	}
+
+	[Fact]
+	public async Task Archive_RespectsTheBatchSize_AndPurgeArchiveDeletesOldRows()
+	{
+		for (var i = 0; i < 5; i++)
+		{
+			await Store.EnqueueAsync(Job("done"));
+		}
+
+		foreach (var job in await ClaimAsync())
+		{
+			await Store.CompleteAsync(job.Id, job.LeaseToken);
+		}
+
+		Clock.Advance(TimeSpan.FromHours(2));
+
+		Assert.Equal(3, await Store.ArchiveAsync(TimeSpan.FromHours(1), batchSize: 3));
+		Assert.Equal(2, await Store.ArchiveAsync(TimeSpan.FromHours(1), batchSize: 3));
+		Assert.Equal(0, await Store.ArchiveAsync(TimeSpan.FromHours(1), batchSize: 3));
+
+		Clock.Advance(TimeSpan.FromDays(10));
+
+		Assert.Equal(5, await Store.PurgeArchiveAsync(TimeSpan.FromDays(7)));
+		Assert.Equal(0L, await ScalarAsync<long>("SELECT count(*) FROM job_archive"));
+	}
+
+	// ------------------------------------------------------------ per-queue limits
+
+	private Task<IReadOnlyList<ClaimedJob>> ClaimLimitedAsync(QueueLimit limit, int max = 10) =>
+		Store.ClaimLimitedAsync("test-worker", "lim", limit, max, TimeSpan.FromSeconds(30));
+
+	private async Task EnqueueManyAsync(int count, string queue = "lim")
+	{
+		for (var i = 0; i < count; i++)
+		{
+			await Store.EnqueueAsync(Job("limited", queue));
+		}
+	}
+
+	[Fact]
+	public async Task QueueLimit_MaxConcurrency_CapsRunningJobs_AndFreesRoomWhenOneFinishes()
+	{
+		await EnqueueManyAsync(5);
+		var limit = new QueueLimit(MaxConcurrency: 2);
+
+		var first = await ClaimLimitedAsync(limit);
+
+		Assert.Equal(2, first.Count);
+		Assert.Empty(await ClaimLimitedAsync(limit));
+
+		await Store.CompleteAsync(first[0].Id, first[0].LeaseToken);
+
+		Assert.Single(await ClaimLimitedAsync(limit));
+		Assert.Empty(await ClaimLimitedAsync(limit));
+	}
+
+	[Fact]
+	public async Task QueueLimit_MaxConcurrency_DoesNotCountExpiredLeases()
+	{
+		await EnqueueManyAsync(4);
+		var limit = new QueueLimit(MaxConcurrency: 2);
+
+		Assert.Equal(2, (await ClaimLimitedAsync(limit)).Count);
+
+		Clock.Advance(TimeSpan.FromSeconds(31)); // both leases lapsed: those workers are presumed dead
+
+		Assert.Equal(2, (await ClaimLimitedAsync(limit)).Count);
+	}
+
+	[Fact]
+	public async Task QueueLimit_MaxConcurrency_HoldsWhenManyWorkersClaimAtOnce()
+	{
+		await EnqueueManyAsync(30);
+		var limit = new QueueLimit(MaxConcurrency: 3);
+
+		var results = await Task.WhenAll(Enumerable.Range(0, 10).Select(_ => ClaimLimitedAsync(limit, max: 5)));
+
+		Assert.Equal(3, results.Sum(claimed => claimed.Count));
+		Assert.Equal(3L, await ScalarAsync<long>("SELECT count(*) FROM jobs WHERE state = 'running'"));
+	}
+
+	[Fact]
+	public async Task QueueLimit_MaxPerSecond_IsATokenBucketSharedByEveryCaller()
+	{
+		await EnqueueManyAsync(20);
+		var limit = new QueueLimit(MaxPerSecond: 2);
+
+		Assert.Equal(2, (await ClaimLimitedAsync(limit)).Count); // the initial burst
+		Assert.Empty(await ClaimLimitedAsync(limit));
+
+		Clock.Advance(TimeSpan.FromSeconds(1));
+		Assert.Equal(2, (await ClaimLimitedAsync(limit)).Count);
+
+		Clock.Advance(TimeSpan.FromMilliseconds(250)); // half a token
+		Assert.Empty(await ClaimLimitedAsync(limit));
+
+		Clock.Advance(TimeSpan.FromMilliseconds(250)); // a whole token has accumulated since the last claim
+		Assert.Single(await ClaimLimitedAsync(limit));
+
+		Clock.Advance(TimeSpan.FromMinutes(10)); // the bucket never holds more than its burst
+		Assert.Equal(2, (await ClaimLimitedAsync(limit)).Count);
+	}
+
+	[Fact]
+	public async Task QueueLimit_UnlimitedQueuesAreUnaffected()
+	{
+		await EnqueueManyAsync(5, queue: "free");
+
+		Assert.Equal(5, (await Store.ClaimAsync("w", ["free"], 10, TimeSpan.FromSeconds(30))).Count);
+	}
 }

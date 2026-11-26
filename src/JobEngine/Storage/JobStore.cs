@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
 using JobEngine.Jobs;
+using JobEngine.Runtime;
 using JobEngine.Scheduling;
 using JobEngine.Workflows;
 using Npgsql;
@@ -248,6 +249,7 @@ public sealed class JobStore : IAsyncDisposable
 			.With("run_at", NpgsqlDbType.TimestampTz, now + request.Delay)
 			.With("max_attempts", NpgsqlDbType.Integer, request.MaxAttempts ?? _options.DefaultMaxAttempts)
 			.With("key", NpgsqlDbType.Text, request.IdempotencyKey)
+			.With("timeout_ms", NpgsqlDbType.Integer, request.Timeout is { } timeout ? (object)(int)Math.Min(int.MaxValue, timeout.TotalMilliseconds) : null)
 			.With("now", NpgsqlDbType.TimestampTz, now))
 		{
 			createdId = await insert.ExecuteScalarAsync(ct) as Guid?;
@@ -259,6 +261,8 @@ public sealed class JobStore : IAsyncDisposable
 			{
 				await NotifyAsync(connection, transaction, ct);
 			}
+
+			JobEngineTelemetry.Enqueued.Add(1, new KeyValuePair<string, object?>("queue", request.Queue), new KeyValuePair<string, object?>("type", request.Type));
 
 			return new EnqueueResult(created, Created: true);
 		}
@@ -281,6 +285,11 @@ public sealed class JobStore : IAsyncDisposable
 		ArgumentException.ThrowIfNullOrWhiteSpace(request.Type);
 		ArgumentException.ThrowIfNullOrWhiteSpace(request.Queue);
 		ArgumentOutOfRangeException.ThrowIfLessThan(request.Delay, TimeSpan.Zero);
+
+		if (request.Timeout is { } timeout && timeout <= TimeSpan.Zero)
+		{
+			throw new ArgumentOutOfRangeException(nameof(request), "Timeout must be positive.");
+		}
 
 		if (request.MaxAttempts is < 1)
 		{
@@ -308,7 +317,21 @@ public sealed class JobStore : IAsyncDisposable
 
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
 		var now = await NowAsync(connection, null, ct);
-		await using var command = new NpgsqlCommand(Sql.Claim, connection)
+
+		return await ClaimCoreAsync(connection, null, owner, queues, maxJobs, leaseDuration, now, ct);
+	}
+
+	private static async Task<IReadOnlyList<ClaimedJob>> ClaimCoreAsync(
+		NpgsqlConnection connection,
+		NpgsqlTransaction? transaction,
+		string owner,
+		IReadOnlyCollection<string> queues,
+		int maxJobs,
+		TimeSpan leaseDuration,
+		DateTime now,
+		CancellationToken ct)
+	{
+		await using var command = new NpgsqlCommand(Sql.Claim, connection, transaction)
 			.With("queues", NpgsqlDbType.Array | NpgsqlDbType.Text, queues.ToArray())
 			.With("now", NpgsqlDbType.TimestampTz, now)
 			.With("max", NpgsqlDbType.Integer, maxJobs)
@@ -328,8 +351,99 @@ public sealed class JobStore : IAsyncDisposable
 				reader.GetString(3),
 				reader.GetInt32(4),
 				reader.GetInt32(5),
-				reader.GetGuid(6)));
+				reader.GetGuid(6),
+				reader.IsDBNull(7) ? null : reader.GetInt32(7)));
 		}
+
+		return claimed;
+	}
+
+	/// <summary>
+	/// Claims from one queue that has a cluster-wide limit. All processes take a per-queue advisory lock
+	/// first, so the running-count check and the token bucket cannot be raced by another worker.
+	/// </summary>
+	public async Task<IReadOnlyList<ClaimedJob>> ClaimLimitedAsync(
+		string owner,
+		string queue,
+		QueueLimit limit,
+		int maxJobs,
+		TimeSpan leaseDuration,
+		CancellationToken ct = default)
+	{
+		ArgumentNullException.ThrowIfNull(limit);
+
+		if (maxJobs < 1)
+		{
+			return [];
+		}
+
+		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		await using var transaction = await connection.BeginTransactionAsync(ct);
+		var now = await NowAsync(connection, transaction, ct);
+
+		await using (var advisory = new NpgsqlCommand("SELECT pg_advisory_xact_lock(hashtextextended(@queue, 7272002));", connection, transaction)
+			.With("queue", NpgsqlDbType.Text, queue))
+		{
+			await advisory.ExecuteNonQueryAsync(ct);
+		}
+
+		var allowance = maxJobs;
+
+		if (limit.MaxConcurrency is { } cap)
+		{
+			await using var count = new NpgsqlCommand(Sql.CountRunning, connection, transaction)
+				.With("queue", NpgsqlDbType.Text, queue)
+				.With("now", NpgsqlDbType.TimestampTz, now);
+
+			var running = (long)(await count.ExecuteScalarAsync(ct))!;
+
+			allowance = (int)Math.Min(allowance, Math.Max(0, cap - running));
+		}
+
+		var tokens = 0.0;
+
+		if (limit.MaxPerSecond is { } rate)
+		{
+			var burst = limit.Burst ?? Math.Max(1, (int)Math.Ceiling(rate));
+
+			await using (var ensure = new NpgsqlCommand(Sql.EnsureQueueLimit, connection, transaction)
+				.With("queue", NpgsqlDbType.Text, queue)
+				.With("tokens", NpgsqlDbType.Double, (double)burst)
+				.With("now", NpgsqlDbType.TimestampTz, now))
+			{
+				await ensure.ExecuteNonQueryAsync(ct);
+			}
+
+			DateTime updatedAt;
+
+			await using (var read = new NpgsqlCommand(Sql.LockQueueLimit, connection, transaction)
+				.With("queue", NpgsqlDbType.Text, queue))
+			await using (var reader = await read.ExecuteReaderAsync(ct))
+			{
+				await reader.ReadAsync(ct);
+				tokens = reader.GetDouble(0);
+				updatedAt = reader.GetFieldValue<DateTime>(1);
+			}
+
+			tokens = Math.Min(burst, tokens + Math.Max(0, (now - updatedAt).TotalSeconds) * rate);
+			allowance = (int)Math.Min(allowance, Math.Floor(tokens));
+		}
+
+		IReadOnlyList<ClaimedJob> claimed = allowance > 0
+			? await ClaimCoreAsync(connection, transaction, owner, [queue], allowance, leaseDuration, now, ct)
+			: [];
+
+		if (limit.MaxPerSecond is not null && claimed.Count > 0)
+		{
+			await using var save = new NpgsqlCommand(Sql.SaveQueueLimit, connection, transaction)
+				.With("queue", NpgsqlDbType.Text, queue)
+				.With("tokens", NpgsqlDbType.Double, tokens - claimed.Count)
+				.With("now", NpgsqlDbType.TimestampTz, now);
+
+			await save.ExecuteNonQueryAsync(ct);
+		}
+
+		await transaction.CommitAsync(ct);
 
 		return claimed;
 	}
@@ -575,7 +689,14 @@ public sealed class JobStore : IAsyncDisposable
 	public async Task<JobRecord?> GetAsync(Guid id, CancellationToken ct = default)
 	{
 		await using var connection = await _dataSource.OpenConnectionAsync(ct);
-		await using var command = new NpgsqlCommand(Sql.SelectJob, connection)
+
+		return await ReadJobAsync(connection, Sql.SelectJob, id, ct)
+			?? await ReadJobAsync(connection, Sql.SelectArchivedJob, id, ct);
+	}
+
+	private static async Task<JobRecord?> ReadJobAsync(NpgsqlConnection connection, string sql, Guid id, CancellationToken ct)
+	{
+		await using var command = new NpgsqlCommand(sql, connection)
 			.With("id", NpgsqlDbType.Uuid, id);
 
 		await using var reader = await command.ExecuteReaderAsync(ct);
@@ -599,6 +720,33 @@ public sealed class JobStore : IAsyncDisposable
 			reader.IsDBNull(10) ? null : reader.GetString(10),
 			reader.GetFieldValue<DateTime>(11),
 			reader.IsDBNull(12) ? null : reader.GetFieldValue<DateTime>(12));
+	}
+
+	/// <summary>Moves one batch of old succeeded jobs to <c>job_archive</c>. Returns how many moved.</summary>
+	public async Task<int> ArchiveAsync(TimeSpan olderThan, int batchSize = 1000, CancellationToken ct = default)
+	{
+		ArgumentOutOfRangeException.ThrowIfLessThan(batchSize, 1);
+
+		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
+
+		await using var command = new NpgsqlCommand(Sql.ArchiveFinished, connection)
+			.With("cutoff", NpgsqlDbType.TimestampTz, now - olderThan)
+			.With("batch", NpgsqlDbType.Integer, batchSize);
+
+		return (int)(long)(await command.ExecuteScalarAsync(ct))!;
+	}
+
+	/// <summary>Deletes archived jobs older than the given age.</summary>
+	public async Task<int> PurgeArchiveAsync(TimeSpan olderThan, CancellationToken ct = default)
+	{
+		await using var connection = await _dataSource.OpenConnectionAsync(ct);
+		var now = await NowAsync(connection, null, ct);
+
+		await using var command = new NpgsqlCommand(Sql.PurgeArchive, connection)
+			.With("cutoff", NpgsqlDbType.TimestampTz, now - olderThan);
+
+		return await command.ExecuteNonQueryAsync(ct);
 	}
 
 	public async Task<JobStats> GetStatsAsync(CancellationToken ct = default)

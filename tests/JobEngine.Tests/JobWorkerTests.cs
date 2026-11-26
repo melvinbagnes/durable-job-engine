@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using JobEngine.Jobs;
 using JobEngine.Runtime;
 using JobEngine.Scheduling;
@@ -440,5 +442,180 @@ public class JobWorkerTests : PostgresTestBase
 		var id = (await Store.EnqueueAsync(new EnqueueRequest { Type = "later", Delay = TimeSpan.FromSeconds(1) })).JobId;
 
 		await WaitUntilAsync(async () => (await GetJobAsync(id)).State == JobState.Succeeded, TimeSpan.FromSeconds(10));
+	}
+
+	// ------------------------------------------------------------ per-job timeout
+
+	[Fact]
+	public async Task Timeout_CancelsACooperativeHandler_ThenRetries()
+	{
+		await using var engine = Build(builder => builder.AddHandler("slow-then-fast", async (context, ct) =>
+		{
+			if (context.Attempt == 1)
+			{
+				await Task.Delay(Timeout.Infinite, ct);
+			}
+		}));
+
+		var id = (await Store.EnqueueAsync(new EnqueueRequest { Type = "slow-then-fast", Timeout = TimeSpan.FromMilliseconds(300) })).JobId;
+
+		await engine.StartAsync();
+		await WaitForStateAsync(id, JobState.Succeeded);
+
+		var job = await GetJobAsync(id);
+
+		Assert.Equal(2, job.Attempts);
+		Assert.Contains("timeout", job.LastError, StringComparison.OrdinalIgnoreCase);
+	}
+
+	[Fact]
+	public async Task Timeout_AbandonsAHandlerThatIgnoresItsToken_AndFreesTheSlot()
+	{
+		await using var engine = Build(
+			builder => builder.AddHandler("deaf", async (_, _) => await Task.Delay(TimeSpan.FromSeconds(5))),
+			options =>
+			{
+				options.Concurrency = 1;
+				options.TimeoutGrace = TimeSpan.FromMilliseconds(200);
+			});
+
+		var stuck = (await Store.EnqueueAsync(new EnqueueRequest { Type = "deaf", Timeout = TimeSpan.FromMilliseconds(200), MaxAttempts = 1 })).JobId;
+
+		await engine.StartAsync();
+		await WaitForStateAsync(stuck, JobState.Dead);
+
+		Assert.Contains("timeout", (await GetJobAsync(stuck)).LastError, StringComparison.OrdinalIgnoreCase);
+	}
+
+	[Fact]
+	public async Task DefaultJobTimeout_AppliesToJobsThatSetNone()
+	{
+		await using var engine = Build(
+			builder => builder.AddHandler("hang", async (_, ct) => await Task.Delay(Timeout.Infinite, ct)),
+			options => options.DefaultJobTimeout = TimeSpan.FromMilliseconds(300));
+
+		var id = (await Store.EnqueueAsync(new EnqueueRequest { Type = "hang", MaxAttempts = 1 })).JobId;
+
+		await engine.StartAsync();
+		await WaitForStateAsync(id, JobState.Dead);
+	}
+
+	// ------------------------------------------------------------ cluster-wide queue limit
+
+	[Fact]
+	public async Task QueueLimit_MaxConcurrency_HoldsAcrossAllSlots()
+	{
+		var running = 0;
+		var peak = 0;
+
+		await using var engine = Build(
+			builder => builder.AddHandler("serial", async (_, ct) =>
+			{
+				var now = Interlocked.Increment(ref running);
+				InterlockedMax(ref peak, now);
+				await Task.Delay(40, ct);
+				Interlocked.Decrement(ref running);
+			}),
+			options =>
+			{
+				options.Queues = ["serial"];
+				options.Concurrency = 4;
+				options.QueueLimits["serial"] = new QueueLimit(MaxConcurrency: 1);
+			});
+
+		for (var i = 0; i < 6; i++)
+		{
+			await Store.EnqueueAsync(Job("serial", "serial"));
+		}
+
+		await engine.StartAsync();
+		await WaitUntilAsync(async () => (await Store.GetStatsAsync()).Count(JobState.Succeeded) == 6);
+
+		Assert.Equal(1, peak);
+	}
+
+	private static void InterlockedMax(ref int target, int value)
+	{
+		int current;
+
+		do
+		{
+			current = Volatile.Read(ref target);
+		}
+		while (value > current && Interlocked.CompareExchange(ref target, value, current) != current);
+	}
+
+	// ------------------------------------------------------------ metrics and tracing
+
+	private sealed record Measurement(string Instrument, double Value, Dictionary<string, object?> Tags);
+
+	private static Dictionary<string, object?> ToDictionary(ReadOnlySpan<KeyValuePair<string, object?>> tags)
+	{
+		var result = new Dictionary<string, object?>();
+
+		foreach (var tag in tags)
+		{
+			result[tag.Key] = tag.Value;
+		}
+
+		return result;
+	}
+
+	[Fact]
+	public async Task Telemetry_RecordsEnqueueAndOutcomeMetrics_AndOneSpanPerExecution()
+	{
+		var measurements = new ConcurrentBag<Measurement>();
+		var spans = new ConcurrentBag<Activity>();
+
+		using var meterListener = new MeterListener();
+		meterListener.InstrumentPublished = (instrument, listener) =>
+		{
+			if (instrument.Meter.Name == JobEngineTelemetry.Name)
+			{
+				listener.EnableMeasurementEvents(instrument);
+			}
+		};
+		meterListener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+			measurements.Add(new Measurement(instrument.Name, value, ToDictionary(tags))));
+		meterListener.SetMeasurementEventCallback<double>((instrument, value, tags, _) =>
+			measurements.Add(new Measurement(instrument.Name, value, ToDictionary(tags))));
+		meterListener.Start();
+
+		using var activityListener = new ActivityListener
+		{
+			ShouldListenTo = source => source.Name == JobEngineTelemetry.Name,
+			Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+			ActivityStopped = activity => spans.Add(activity)
+		};
+		ActivitySource.AddActivityListener(activityListener);
+
+		await using var engine = Build(
+			builder => builder
+				.AddHandler("good", (_, _) => Task.CompletedTask)
+				.AddHandler("bad", (_, _) => throw new InvalidOperationException("nope")),
+			options => options.Queues = ["telemetry"]);
+
+		var good = (await Store.EnqueueAsync(Job("good", "telemetry"))).JobId;
+		var bad = (await Store.EnqueueAsync(new EnqueueRequest { Type = "bad", Queue = "telemetry", MaxAttempts = 1 })).JobId;
+
+		await engine.StartAsync();
+		await WaitForStateAsync(good, JobState.Succeeded);
+		await WaitForStateAsync(bad, JobState.Dead);
+		await engine.StopAsync();
+
+		var ours = measurements.Where(m => Equals(m.Tags.GetValueOrDefault("queue"), "telemetry")).ToList();
+
+		Assert.Equal(2, ours.Where(m => m.Instrument == JobEngineTelemetry.EnqueuedMetric).Sum(m => m.Value));
+		Assert.Equal(1, ours.Where(m => m.Instrument == JobEngineTelemetry.ProcessedMetric && Equals(m.Tags["outcome"], "succeeded")).Sum(m => m.Value));
+		Assert.Equal(1, ours.Where(m => m.Instrument == JobEngineTelemetry.ProcessedMetric && Equals(m.Tags["outcome"], "dead")).Sum(m => m.Value));
+		Assert.Equal(2, ours.Count(m => m.Instrument == JobEngineTelemetry.DurationMetric));
+
+		var goodSpan = Assert.Single(spans, span => Equals(span.GetTagItem("jobengine.job.id")?.ToString(), good.ToString()));
+		var badSpan = Assert.Single(spans, span => Equals(span.GetTagItem("jobengine.job.id")?.ToString(), bad.ToString()));
+
+		Assert.Equal(ActivityStatusCode.Unset, goodSpan.Status);
+		Assert.Equal(ActivityStatusCode.Error, badSpan.Status);
+		Assert.Equal("succeeded", goodSpan.GetTagItem("jobengine.job.outcome"));
+		Assert.Equal("dead", badSpan.GetTagItem("jobengine.job.outcome"));
 	}
 }

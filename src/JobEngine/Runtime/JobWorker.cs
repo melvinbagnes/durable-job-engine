@@ -89,7 +89,25 @@ public sealed class JobWorker(
 	{
 		try
 		{
-			return await store.ClaimAsync(options.WorkerId, options.Queues.ToArray(), free, options.LeaseDuration, ct);
+			var claimed = new List<ClaimedJob>();
+
+			// Limited queues first: their allowance is small, so unlimited queues must not starve them of free slots.
+			foreach (var queue in options.Queues)
+			{
+				if (claimed.Count < free && options.QueueLimits.TryGetValue(queue, out var limit))
+				{
+					claimed.AddRange(await store.ClaimLimitedAsync(options.WorkerId, queue, limit, free - claimed.Count, options.LeaseDuration, ct));
+				}
+			}
+
+			var unlimited = options.Queues.Where(queue => !options.QueueLimits.ContainsKey(queue)).ToArray();
+
+			if (claimed.Count < free && unlimited.Length > 0)
+			{
+				claimed.AddRange(await store.ClaimAsync(options.WorkerId, unlimited, free - claimed.Count, options.LeaseDuration, ct));
+			}
+
+			return claimed;
 		}
 		catch (OperationCanceledException) when (ct.IsCancellationRequested)
 		{

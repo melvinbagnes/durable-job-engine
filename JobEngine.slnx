@@ -5,6 +5,8 @@
 	</Folder>
 	<Folder Name="/benchmarks/">
 		<Project Path="benchmarks/JobEngine.Benchmarks/JobEngine.Benchmarks.csproj" />
+		<Project Path="benchmarks/JobEngine.Soak/JobEngine.Soak.csproj" />
+		<Project Path="benchmarks/JobEngine.Compare/JobEngine.Compare.csproj" />
 	</Folder>
 	<Folder Name="/tests/">
 		<Project Path="tests/JobEngine.Tests/JobEngine.Tests.csproj" />

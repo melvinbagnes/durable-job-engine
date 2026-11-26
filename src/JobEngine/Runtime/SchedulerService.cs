@@ -42,6 +42,7 @@ public sealed class SchedulerService(JobStore store, JobEngineOptions options, I
 		}
 
 		var lastPurge = DateTime.MinValue;
+		var lastArchive = DateTime.MinValue;
 
 		while (!stoppingToken.IsCancellationRequested)
 		{
@@ -63,6 +64,38 @@ public sealed class SchedulerService(JobStore store, JobEngineOptions options, I
 					if (purged > 0)
 					{
 						logger.LogInformation("Purged {Purged} finished job(s).", purged);
+					}
+				}
+
+				if (DateTime.UtcNow - lastArchive >= PurgeEvery && (options.ArchiveAfter is not null || options.ArchiveRetention is not null))
+				{
+					lastArchive = DateTime.UtcNow;
+
+					if (options.ArchiveAfter is { } archiveAfter)
+					{
+						var moved = 0;
+
+						// A bounded number of batches per tick, so one tick never monopolises the database.
+						for (var batch = 0; batch < 20; batch++)
+						{
+							var count = await store.ArchiveAsync(archiveAfter, ct: stoppingToken);
+							moved += count;
+
+							if (count == 0)
+							{
+								break;
+							}
+						}
+
+						if (moved > 0)
+						{
+							logger.LogInformation("Archived {Moved} succeeded job(s).", moved);
+						}
+					}
+
+					if (options.ArchiveRetention is { } archiveRetention)
+					{
+						await store.PurgeArchiveAsync(archiveRetention, stoppingToken);
 					}
 				}
 			}
