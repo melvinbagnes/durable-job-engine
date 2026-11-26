@@ -255,7 +255,7 @@ static async Task<int> RunOrchestrator()
 				{
 					gaps[gap < 1 ? 0 : gap < 3 ? 1 : gap < 10 ? 2 : 3]++;
 
-					if (killedAt.TryGetValue(previousWorker, out var killTime) && killTime >= previousAt && (killTime - previousAt).TotalSeconds < 10)
+					if (killedAt.TryGetValue(previousWorker, out var killTime) && (killTime - previousAt).TotalSeconds is > -1 and < 10)
 					{
 						afterKill++;
 					}
