@@ -16,7 +16,9 @@ It exists to answer one question properly: **what has to be true for a job queue
 | **Idempotent enqueue** | Unique idempotency key; N concurrent enqueues with the same key create exactly one job |
 | **Transactional outbox** | Enqueue inside *your* transaction; the job exists if and only if your business change commits |
 | **Workflows (DAGs)** | Steps with dependencies; failures cancel downstream steps, replay revives them |
-| **Cron schedules** | 5-field cron, safe with many scheduler processes, one job per slot |
+| **Instant wake-up** | PostgreSQL `LISTEN/NOTIFY` wakes idle workers the moment a job becomes runnable; polling stays as a backstop |
+| **One clock** | Leases, delays and cron slots are all timed by the database server's clock, so skewed worker clocks cannot disagree |
+| **Cron schedules** | 5-field cron in UTC or any IANA time zone, with defined DST behaviour; safe with many scheduler processes, one job per slot |
 | **Graceful shutdown** | In-flight jobs are released back to the queue without spending an attempt |
 
 ## Architecture
@@ -36,11 +38,13 @@ flowchart LR
     subgraph w["Worker process (any number)"]
         direction TB
         W["JobWorker<br/>claim loop"] --> P["JobProcessor<br/>handler + heartbeat"]
+        N["JobNotificationListener<br/>LISTEN"] -. "wake" .-> W
         SC["SchedulerService<br/>cron + reaper + purge"]
     end
 
     API -- "enqueue (own transaction = outbox)" --> J
     API -- "workflow" --> D
+    J -. "pg_notify when a job is runnable" .-> N
     W -- "claim: SKIP LOCKED + lease" --> J
     P -- "heartbeat / complete / fail<br/>(fenced by lease token)" --> J
     SC -- "fire due slots" --> S
@@ -86,7 +90,18 @@ stateDiagram-v2
 
 > **A race worth knowing about.** If two parents of the same child finish at the same moment, each transaction sees the other parent as "still running", so neither promotes the child and it waits forever. I reproduced this against PostgreSQL with two concurrent transactions (the child was stuck in 3 of 6 rounds of my reproduction). The fix is to lock the waiting children (`FOR UPDATE`, in id order to avoid deadlocks) before checking, which serialises the check so the second transaction sees the first one's commit. `Workflow_TwoParentsFinishingTogether_AlwaysReleaseTheChild` guards it.
 
-**Cron.** A small, dependency-free 5-field parser (`*`, lists, ranges, steps, `7` = Sunday, classic day-of-month/day-of-week OR rule). Each schedule row is taken with `SKIP LOCKED`, and every slot's job carries the idempotency key `schedule:{name}:{slot}`, so any number of scheduler processes produce one job per slot. After downtime, missed slots fire **once**, not once per missed slot. Re-registering an unchanged schedule on redeploy keeps its next slot.
+**Waking idle workers.** An idle worker waits on a signal with `PollInterval` as the timeout. Every statement that makes a job runnable *now* (enqueue, a dependency completing, a shutdown release, a replay) also runs `pg_notify`, and a dedicated listener connection sets the signal. Because `pg_notify` inside a transaction is delivered on commit, an outbox job inside *your* transaction wakes workers only if your transaction commits. The signal is a latch, so a notification that arrives while the worker is busy is not lost. NOTIFY is an optimisation, not something correctness depends on: a dropped listener connection is retried, the first reconnect wakes the worker once, and polling keeps picking up work (including delayed jobs and retries, whose due time arrives with no event).
+
+**One clock.** Lease expiry, `run_at`, retry backoff and cron slots are all computed from `clock_timestamp()` on the database server, not from each worker's clock. Two workers whose clocks disagree by minutes still agree on whether a lease has expired. A `TimeProvider` is used only if you register one (the store tests do, to fast-forward time).
+
+**Cron.** A small, dependency-free 5-field parser (`*`, lists, ranges, steps, `7` = Sunday, classic day-of-month/day-of-week OR rule). Each schedule row is taken with `SKIP LOCKED`, and every slot's job carries the idempotency key `schedule:{name}:{slot}`, so any number of scheduler processes produce one job per slot. After downtime, missed slots fire **once**, not once per missed slot. Re-registering an unchanged schedule on redeploy keeps its next slot; changing the expression or the time zone recomputes it.
+
+**Cron and time zones.** `RecurringJobDefinition.TimeZone` takes an IANA id (`"Asia/Manila"`, `"America/New_York"`); null means UTC. Daylight saving is handled with two explicit rules:
+
+- A schedule that runs in *every* hour (`*/10 * * * *`, `0 * * * *`) follows real elapsed time: nothing is skipped when clocks jump forward, and the repeated hour in autumn runs again.
+- A schedule that *names* hours (`30 2 * * *`) runs once per wall-clock day. A time that does not exist (02:30 on the spring-forward day) runs at the same instant shifted past the gap (03:30); a time that happens twice (01:30 in autumn) runs at its first occurrence only.
+
+Both are covered by tests against `America/New_York` on the 2026 transition dates. Zone data comes from the operating system, so a container image without `tzdata` fails at startup with `TimeZoneNotFoundException` instead of silently running at the wrong hour.
 
 ## Quick start
 
@@ -107,6 +122,8 @@ curl -X POST localhost:8080/orders -H 'content-type: application/json' \
 
 curl localhost:8080/stats
 ```
+
+`scripts/smoke.sh` runs this whole tour (retry, idempotency, dead-letter and replay, workflow order, cycle rejection, outbox, stats) against the running stack and fails on any deviation. CI runs it on every push against a fresh `docker compose up --build`.
 
 ### Using it
 
@@ -139,7 +156,7 @@ await store.EnqueueWorkflowAsync(
 
 ## Tests
 
-`dotnet test` needs a PostgreSQL server (`JOBENGINE_TEST_CONNECTION`, default `postgres/postgres@localhost:5432`); `docker compose up -d db` provides one. Each test gets its own schema. Store tests use a fake clock so leases, backoff and cron slots can be fast-forwarded; worker tests run the real hosted services with the real clock.
+104 tests. `dotnet test` needs a PostgreSQL server (`JOBENGINE_TEST_CONNECTION`, default `postgres/postgres@localhost:5432`); `docker compose up -d db` provides one. Each test gets its own schema. Store tests use a fake clock so leases, backoff and cron slots can be fast-forwarded; worker tests run the real hosted services with the real clock.
 
 | What is proven | Test |
 |---|---|
@@ -154,7 +171,33 @@ await store.EnqueueWorkflowAsync(
 | Outbox rolls back with the caller's transaction | `EnqueueInsideACallersTransaction_RollsBackWithIt` |
 | Diamond workflow order, failure cascade, replay, parent race | `Workflow_*` |
 | Two schedulers tick the same slot: one job; missed slots fire once | `Schedule_*` |
+| Cron in a time zone: fixed offsets, DST gap, repeated hour, every-10-minutes across both transitions | `CronExpressionTests.TimeZone_*`, `Schedule_WithATimeZone_*` |
+| An idle worker with a 60 s poll interval runs a new job in well under a second; without NOTIFY it does not | `Notify_*`, `WithoutNotify_*` |
+| NOTIFY also fires when a dependency completes, and only after an outbox transaction commits | `Notify_WakesTheWorkerWhenADependencyCompletes`, `Notify_FromACallersTransaction_*` |
+| Delayed jobs still run on time through the polling backstop | `DelayedJob_RunsOnceDue_EvenWithNoNotificationForIt` |
+| Timestamps come from the database clock | `DatabaseClockTests` |
 | Cron parsing and next-occurrence maths, retry maths, DAG validation | `CronExpressionTests`, `RetryPolicyTests`, `WorkflowGraphTests` |
+
+## Benchmarks
+
+`benchmarks/JobEngine.Benchmarks` runs in CI against PostgreSQL 16 and writes its table to the job summary. The run these numbers come from (GitHub-hosted runner, 4 logical cores, PostgreSQL and workers on the same machine, 20,000 jobs per throughput run, no-op handler):
+
+| Measurement | Result |
+|---|---|
+| Enqueue, 8 parallel producers | 5,425 jobs/s |
+| Drain, 1 worker, concurrency 16 | 1,001 jobs/s |
+| Drain, 4 workers x concurrency 16 | 1,418 jobs/s |
+
+Idle-to-running latency (job enqueued while the worker is idle, poll interval 1 s, 100 samples with NOTIFY and 30 with polling only):
+
+| Mode | p50 | p95 | max |
+|---|---|---|---|
+| LISTEN/NOTIFY | 2 ms | 3 ms | 10 ms |
+| Polling only | 821 ms | 939 ms | 940 ms |
+
+How to read these: the database and all workers share four cores, so four workers are only about 1.4x faster than one; the database is the bottleneck, which is the design's expected limit. Absolute numbers on a shared CI runner vary from run to run and say nothing about dedicated hardware. They are a measured floor for a no-op handler, not a capacity claim, and I did not compare against other queues.
+
+Run it yourself: `JOBENGINE_TEST_CONNECTION=... dotnet run -c Release --project benchmarks/JobEngine.Benchmarks`.
 
 ## Layout
 
@@ -162,21 +205,28 @@ await store.EnqueueWorkflowAsync(
 src/JobEngine/            the library
   Storage/Sql.cs          every statement, in one reviewable file
   Storage/JobStore.cs     state transitions (each one a statement or a short transaction)
-  Runtime/                JobWorker (claim loop), JobProcessor (handler + heartbeat), SchedulerService
-  Scheduling/             CronExpression, RetryPolicy
+  Runtime/                JobWorker (claim loop), JobProcessor (handler + heartbeat), SchedulerService,
+                          JobNotificationListener + WakeSignal (LISTEN/NOTIFY)
+  Scheduling/             CronExpression (UTC and time zones), RetryPolicy
   Workflows/              DAG validation
 src/JobEngine.Demo/       minimal API: jobs, workflows, outbox, stats, replay
 tests/JobEngine.Tests/    unit tests + PostgreSQL integration tests
+benchmarks/               throughput and wake-up latency benchmark (runs in CI)
+scripts/smoke.sh          end-to-end check of the demo API against docker compose
 ```
 
-## Limits (deliberately out of scope)
+## Limits
 
-- **Polling, not push.** Idle workers poll every `PollInterval` (1 s by default). `LISTEN/NOTIFY` would cut latency; polling keeps the failure modes simple.
-- **Clock skew.** Lease and `run_at` comparisons use the application clock. Keep workers on NTP, or set `LeaseDuration` well above the expected skew.
+What is still not covered, stated plainly:
+
+- **Delayed jobs and retries are found by polling.** NOTIFY fires when a job becomes runnable now. A job scheduled for 30 seconds from now, or a retry waiting out its backoff, has no event at the moment it comes due, so it starts within `PollInterval` (1 s by default) of its due time.
+- **LISTEN needs a session-level connection.** Through PgBouncer in transaction-pooling mode, `LISTEN` does not work; point `ConnectionString` at PostgreSQL directly or set `UseListenNotify = false` and accept polling latency. Channels are database-wide, so give environments that share a database different `NotificationChannel` values.
+- **The database clock is the single source of time**, which assumes one writable primary. It removes worker clock skew; it does not help if you fail over to a replica whose clock is badly off.
+- **Cron has minute resolution** and no seconds field. DST behaviour is the two rules above, not a configurable policy.
 - **No per-job timeout or rate limiting.** A handler that never returns holds its slot; the heartbeat keeps its lease alive. Pass the supplied `CancellationToken` into everything you await.
-- **Cron is UTC, minute resolution.** No time zones, no seconds field.
-- **Throughput is bounded by PostgreSQL.** I have not benchmarked it and make no throughput claims; for millions of jobs per minute use a log-based broker.
+- **Throughput is bounded by PostgreSQL** (see the benchmark). For hundreds of thousands of jobs per minute use a log-based broker.
 - **One `jobs` table.** No partitioning; use `CompletedRetention` to keep it small.
+- **Verified on PostgreSQL 16 on Linux only.** The tests, benchmark and docker smoke test all run there; other versions and Windows are untested.
 
 ## License
 
