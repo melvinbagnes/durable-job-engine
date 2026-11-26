@@ -230,4 +230,4 @@ What is still not covered, stated plainly:
 
 ## License
 
-MIT
+All rights reserved. The source is public so it can be read and evaluated (for example by recruiters and hiring managers); copying, modifying or reusing it requires the author's written permission. See [LICENSE](LICENSE).
