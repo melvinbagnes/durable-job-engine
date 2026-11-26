@@ -43,7 +43,7 @@ static async Task<int> RunWorker(string workerId)
 			o.ConnectionString = ConnectionFor(admin, schema, 24);
 			o.WorkerId = workerId;
 			o.Concurrency = WorkerConcurrency;
-			o.LeaseDuration = TimeSpan.FromSeconds(3);
+			o.LeaseDuration = TimeSpan.FromSeconds(double.Parse(Environment.GetEnvironmentVariable("SOAK_LEASE_SECONDS") ?? "3", CultureInfo.InvariantCulture));
 			o.PollInterval = TimeSpan.FromMilliseconds(200);
 			o.SchedulerInterval = TimeSpan.FromSeconds(1);
 			o.RetryPolicy = new JobEngine.Scheduling.RetryPolicy(TimeSpan.FromMilliseconds(100), TimeSpan.FromSeconds(1), 2.0, 0.2);
@@ -91,6 +91,7 @@ static async Task<int> RunOrchestrator()
 	var workerCount = int.Parse(Environment.GetEnvironmentVariable("SOAK_WORKERS") ?? "4", CultureInfo.InvariantCulture);
 	var killEvery = TimeSpan.FromSeconds(double.Parse(Environment.GetEnvironmentVariable("SOAK_KILL_SECONDS") ?? "2.5", CultureInfo.InvariantCulture));
 	var deadline = TimeSpan.FromMinutes(8);
+	var leaseSeconds = Environment.GetEnvironmentVariable("SOAK_LEASE_SECONDS") ?? "3";
 	var schema = "soak_" + Guid.NewGuid().ToString("N");
 
 	await using (var connection = new NpgsqlConnection(admin))
@@ -255,7 +256,7 @@ static async Task<int> RunOrchestrator()
 				{
 					gaps[gap < 1 ? 0 : gap < 3 ? 1 : gap < 10 ? 2 : 3]++;
 
-					if (killedAt.TryGetValue(previousWorker, out var killTime) && (killTime - previousAt).TotalSeconds is > -1 and < 10)
+					if (killedAt.TryGetValue(previousWorker, out var killTime) && (killTime - previousAt).TotalSeconds is > -1 and < 1)
 					{
 						afterKill++;
 					}
@@ -295,7 +296,7 @@ static async Task<int> RunOrchestrator()
 	report.AppendLine("## Chaos soak test");
 	report.AppendLine();
 	report.AppendLine(
-		$"{jobCount:N0} jobs drained by {workerCount} worker processes ({WorkerConcurrency} concurrent jobs each, 3 s leases), " +
+		$"{jobCount:N0} jobs drained by {workerCount} worker processes ({WorkerConcurrency} concurrent jobs each, {leaseSeconds} s leases), " +
 		$"with one process killed by SIGKILL every {killEvery.TotalSeconds:N1} s and replaced. {(problems.Count == 0 ? "**Passed.**" : "**FAILED.**")}");
 	report.AppendLine();
 	report.AppendLine("| Check | Result |");
@@ -307,8 +308,8 @@ static async Task<int> RunOrchestrator()
 	report.AppendLine($"| Handler executions in total | {runs:N0} |");
 	report.AppendLine($"| Retries from injected failures (3% of first attempts) | {injected:N0} |");
 	report.AppendLine($"| Repeat executions in total (at-least-once) | {repeats:N0} ({repeats * 100.0 / jobCount:N1}% of jobs) |");
-	report.AppendLine($"| ...after the previous worker was killed within 10 s | {afterKill:N0} (a kill can strand at most {WorkerConcurrency} jobs; {kills} kills = at most {(long)kills * WorkerConcurrency:N0}) |");
-	report.AppendLine($"| ...with the previous worker not killed in that window | {afterOtherStall:N0} |");
+	report.AppendLine($"| ...after the previous worker was killed within 1 s | {afterKill:N0} (a kill strands at most {WorkerConcurrency} jobs; {kills} kills = at most {(long)kills * WorkerConcurrency:N0}) |");
+	report.AppendLine($"| ...with no kill within 1 s of the earlier run | {afterOtherStall:N0} |");
 	report.AppendLine($"| ...retries after an injected failure | {afterInjectedFailure:N0} |");
 	report.AppendLine($"| Gap between repeats of a job that had not failed: <1 s / 1-3 s / 3-10 s / 10 s+ | {gaps[0]:N0} / {gaps[1]:N0} / {gaps[2]:N0} / {gaps[3]:N0} |");
 	report.AppendLine($"| Jobs that needed more than one attempt | {multiAttempt:N0} |");
@@ -323,7 +324,7 @@ static async Task<int> RunOrchestrator()
 	if (samples.Count > 0)
 	{
 		report.AppendLine();
-		report.AppendLine("Examples of repeats with no kill nearby:");
+		report.AppendLine("Examples of repeats with no kill within 1 s:");
 		report.AppendLine();
 
 		foreach (var sample in samples)
